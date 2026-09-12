@@ -1,0 +1,57 @@
+[package]
+name        = "nvfs-core"
+version     = "0.0.1"
+description = "A littlefs-class filesystem with no device attached: the superblock, the metadata pairs and their commit-and-seal cycle, the CTZ skip-list, the directory entries, and every operation from mount to fsck as a state machine that ANSWERS the block reads and writes a host must perform.  littlefs's four lfs_config callbacks turned into a value, so the format is exercised against a byte array and a power cut is a test that stops feeding answers.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: arithmetic over block numbers, offsets and bytes the caller
+# already holds.  Nothing here reads or programs a page — the machine
+# returns the action and the host performs it — so no function declares
+# an effect, and three of the six modules build for a Cortex-M.
+layer       = "core"
+
+category    = "embedded"
+
+tags        = ["littlefs", "filesystem", "flash", "nor", "wear-levelling", "power-loss", "embedded", "sans-io", "dogfood"]
+repository  = "https://github.com/novolang/nvfs-core"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A power-loss-resilient filesystem with the device left out"
+
+[dependencies]
+# crc-nv, and nothing else.
+#
+# EVERY COMMIT RECORD CARRIES A CRC-32C and a mismatch is what ends a
+# block's valid log, so the checksum is not an accessory here — it is
+# the whole crash-consistency story.  `orbit/novofs` carries its own
+# forty-line bitwise CRC-32C; crc-nv publishes exactly that algorithm,
+# table driven, asserted against the published check value 0xe3069283,
+# with a streaming `update` that takes and returns an `Int` so a record
+# can be summed as it is built.  Two implementations of one polynomial
+# in one registry is the thing worth avoiding.
+#
+# It is named only by `nvfsmeta`, which is not in the device probe.
+# The three modules that ARE — `nvfsgeo`, `nvfsctz`, `nvfswear` — name
+# nothing outside the language.
+#
+# NOT heapless-nv, and the absence is the design rather than an
+# omission.  The device half of this package is integers in the
+# caller's own stack frame; the buffers a firmware needs — the block
+# image it reads into, the record it builds — are the CALLER's, which
+# is the same rule heapless-nv itself follows.  heapless-nv is the
+# package a firmware pairs this with, and the README says so; a
+# dependency would put its bookkeeping between this machine and a
+# buffer it never owns.
+crc-nv = "^0.1.4"

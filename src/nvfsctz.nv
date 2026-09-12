@@ -1,0 +1,312 @@
+// nvfsctz.nv — the CTZ skip-list, as arithmetic over block numbers.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS PART OF THE DEVICE CLAIM.  A seek into a file is the
+// one operation a firmware does in a loop, and it is entirely
+// integers: which block index holds byte `off`, which skip pointer to
+// follow next, how many blocks a file of this size occupies.
+// `NvfsCtzWalk` is that loop's whole state — three `Int`s in a `@value`
+// struct — so a device seeks through a megabyte file with nothing on
+// the heap.
+//
+// WHAT A CTZ SKIP-LIST IS, in one paragraph, because the name is
+// opaque and the shape is not.  A file's data blocks form a chain that
+// runs BACKWARDS: block index `n` points at earlier blocks, and the
+// head of the chain is the LAST block.  Each block reserves K pointer
+// slots holding the block ids at chain indices `n - 1`, `n - 2`,
+// `n - 4`, … `n - 2^(K-1)`, so a walk from index `n` to index `m`
+// takes the largest jump that does not overshoot and repeats — which
+// is O(log n) rather than O(n).  Writing is append-only and never
+// rewrites an earlier block, which is what makes a file copy-on-write
+// by construction.
+//
+// THE CAPACITY IS UNIFORM HERE AND VARIABLE IN littlefs, and the
+// difference is a deliberate, documented trade.  littlefs packs
+// `ctz(n) + 1` pointers into block `n`, so most blocks carry one
+// pointer and only every 2^k-th carries more; the capacity of a block
+// then depends on its index and `offset -> block` becomes a
+// logarithmic search.  `orbit/novofs` reserves K slots in EVERY block
+// instead, which wastes `4 * (K - ctz(n) - 1)` bytes per block and
+// makes `offset -> index` a single division.  That choice is inherited
+// here, it is named in the README, and `capacity` is the one function
+// that would change if it were revisited.
+
+// A walk through a chain, in progress.
+//
+// Three integers and no allocation: where the walk is now, which chain
+// index that block holds, and where it is going.  Copied whole into
+// and out of every step, which is what makes it re-startable — a
+// driver waiting on a read keeps the struct and resumes.
+pub @value
+struct NvfsCtzWalk
+    // The block id the walk is standing on.
+    block: Int
+    // That block's index in the chain.  Counts from 0 at the file's
+    // FIRST block, so the head of the chain has the largest index.
+    index: Int
+    // The chain index the walk is trying to reach.
+    target: Int
+
+// How many skip pointers each block reserves: the bit length of the
+// block count.
+//
+// Enough that a jump of 1, 2, 4, … 2^(K-1) can always reach index 0
+// from any index a device with this many blocks can hold.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.pointer_count(256)}")
+// ```
+pub fn pointer_count(block_count: Int) -> Int []
+    todo("nvfs-core.nvfsctz.pointer_count")
+
+// Where a data block's payload starts: past its pointer slots.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.data_offset(256)}")
+// ```
+pub fn data_offset(block_count: Int) -> Int []
+    todo("nvfs-core.nvfsctz.data_offset")
+
+// How many payload bytes each data block holds.
+//
+// Uniform, which is the trade named at the top of this file: the
+// pointer slots cost the same in every block, and in exchange
+// `index_of_offset` is one division.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.capacity(512, 256)}")
+// ```
+pub fn capacity(block_size: Int, block_count: Int) -> Int []
+    todo("nvfs-core.nvfsctz.capacity")
+
+// How many blocks a file of this size occupies.
+//
+// Zero for an empty file, which is why an empty file has no chain at
+// all and lives inline.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.block_count_for(1000, 480)}")   // 3
+// ```
+pub fn block_count_for(size: Int, capacity_bytes: Int) -> Int []
+    todo("nvfs-core.nvfsctz.block_count_for")
+
+// The chain index holding byte `off`.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.index_of_offset(1000, 480)}")   // 2
+// ```
+pub fn index_of_offset(off: Int, capacity_bytes: Int) -> Int []
+    todo("nvfs-core.nvfsctz.index_of_offset")
+
+// Where inside that block byte `off` lands, counting from the block's
+// payload rather than from its first byte.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.offset_in_block(1000, 480)}")   // 40
+// ```
+pub fn offset_in_block(off: Int, capacity_bytes: Int) -> Int []
+    todo("nvfs-core.nvfsctz.offset_in_block")
+
+// The chain index of the file's last block.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.last_index(1000, 480)}")        // 2
+// ```
+pub fn last_index(size: Int, capacity_bytes: Int) -> Int []
+    todo("nvfs-core.nvfsctz.last_index")
+
+// Where skip pointer `j` sits inside a data block.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.pointer_offset(2)}")            // 8
+// ```
+pub fn pointer_offset(j: Int) -> Int []
+    todo("nvfs-core.nvfsctz.pointer_offset")
+
+// The chain index skip pointer `j` of a block at `index` reaches.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.pointer_target(9, 3)}")         // 1
+// ```
+pub fn pointer_target(index: Int, j: Int) -> Int []
+    todo("nvfs-core.nvfsctz.pointer_target")
+
+// The value a pointer slot holds when there is nothing to point at.
+//
+// The erased word, so an unwritten slot and an absent pointer are the
+// same bits — which means a block programmed once needs no second pass
+// to mark its unused slots.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.absent_pointer()}")
+// ```
+pub fn absent_pointer() -> Int []
+    todo("nvfs-core.nvfsctz.absent_pointer")
+
+// A walk from a block at a known chain index towards a target index.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     let w = nvfsctz.walk(41, 9, 1)
+//     println("${nvfsctz.walk_block(w)}")
+// ```
+pub fn walk(head_block: Int, head_index: Int, target: Int) -> NvfsCtzWalk []
+    todo("nvfs-core.nvfsctz.walk")
+
+// Which skip pointer to read next: the largest jump that does not
+// overshoot the target, or -1 when the walk has arrived.
+//
+// The whole of the seek, as one comparison per candidate jump.  A
+// driver reads pointer `j` out of the block it is standing on and
+// hands the value back to `walk_step`.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.walk_jump(nvfsctz.walk(41, 9, 1), 9)}")
+// ```
+pub fn walk_jump(w: NvfsCtzWalk, pointers: Int) -> Int []
+    todo("nvfs-core.nvfsctz.walk_jump")
+
+// The walk after following pointer `j` to `next_block`.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     let w = nvfsctz.walk(41, 9, 1)
+//     println("${nvfsctz.walk_index(nvfsctz.walk_step(w, 3, 33))}")
+// ```
+pub fn walk_step(w: NvfsCtzWalk, j: Int, next_block: Int) -> NvfsCtzWalk []
+    todo("nvfs-core.nvfsctz.walk_step")
+
+// Whether the walk has reached its target.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.walk_done(nvfsctz.walk(41, 9, 9))}")
+// ```
+pub fn walk_done(w: NvfsCtzWalk) -> Bool []
+    todo("nvfs-core.nvfsctz.walk_done")
+
+// The block the walk is standing on.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.walk_block(nvfsctz.walk(41, 9, 1))}")
+// ```
+pub fn walk_block(w: NvfsCtzWalk) -> Int []
+    todo("nvfs-core.nvfsctz.walk_block")
+
+// The chain index the walk is standing at.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.walk_index(nvfsctz.walk(41, 9, 1))}")
+// ```
+pub fn walk_index(w: NvfsCtzWalk) -> Int []
+    todo("nvfs-core.nvfsctz.walk_index")
+
+// How many pointer reads a walk between two indices costs.
+//
+// The O(log n) claim as a number, so it can be asserted rather than
+// believed: a 100,000-block chain seeks in at most seventeen reads,
+// and a test says so.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.seek_reads(9, 1, 9)}")
+// ```
+pub fn seek_reads(from_index: Int, to_index: Int, pointers: Int) -> Int []
+    todo("nvfs-core.nvfsctz.seek_reads")
+
+// Whether a block id read out of a pointer slot could be a real one.
+//
+// A chain is the one structure in this format a corrupt pointer can
+// send off the end of the device, so every hop is bounds-checked and a
+// failure is `NvfsCorrupt` rather than a read of block four billion.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.pointer_is_plausible(33, 256)}")
+// ```
+pub fn pointer_is_plausible(block: Int, block_count: Int) -> Bool []
+    todo("nvfs-core.nvfsctz.pointer_is_plausible")
+
+// Whether a file of this size lives inline in its directory entry
+// rather than in a chain.
+//
+// The threshold is configuration, so it is a parameter: a file at or
+// below it costs no data block at all, which on a device storing
+// hundreds of tiny files is most of the volume.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.is_inline(64, 128)}")
+// ```
+pub fn is_inline(size: Int, inline_max: Int) -> Bool []
+    todo("nvfs-core.nvfsctz.is_inline")
+
+// Whether a shrink to `new_size` can reuse the chain it already has.
+//
+// The prefix of a CTZ chain is itself a valid chain, so a truncation
+// is a new head and a new size and no data movement at all — which is
+// the one place this format is cheaper than a rewrite, and worth
+// publishing so a caller can tell the cheap shrink from the expensive
+// one.
+//
+// ```novo
+// use nvfsctz
+//
+// fn main() [io]
+//     println("${nvfsctz.shrink_reuses_prefix(1000, 500, 480, 128)}")
+// ```
+pub fn shrink_reuses_prefix(size: Int, new_size: Int, capacity_bytes: Int,
+                            inline_max: Int) -> Bool []
+    todo("nvfs-core.nvfsctz.shrink_reuses_prefix")

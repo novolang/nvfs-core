@@ -1,0 +1,150 @@
+// nvfsctz_tests.nv — the skip-list, as arithmetic that can be checked
+// without a device.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfsctz.<fn>`.
+//
+// THE O(log n) CLAIM IS ASSERTED, NOT DESCRIBED.  A skip list whose
+// seek is linear is still correct and is the bug worth catching, and
+// `seek_reads` is the number that catches it: a hundred-thousand-block
+// chain seeks in at most seventeen reads, and the case below says so.
+//
+// THE UNIFORM-CAPACITY TRADE IS ASSERTED TOO.  `orbit/novofs` reserves
+// K pointer slots in every block where littlefs packs `ctz(n) + 1`, and
+// the consequence — `offset -> index` is one division — is exactly what
+// makes `index_of_offset` testable as a closed form.  A change to
+// variable packing would fail these cases, which is the point of
+// writing them down.
+
+use std.test
+use nvfsctz
+
+@test
+fn test_every_block_reserves_enough_pointers_to_reach_the_start() [io]
+    test.case("K is the bit length of the block count")
+    test.assert(nvfsctz.pointer_count(256) == 9)
+    test.assert(nvfsctz.pointer_count(1) == 1)
+
+    test.case("so the largest jump, 2^(K-1), reaches index 0 from the last index")
+    test.assert(nvfsctz.pointer_target(255, nvfsctz.pointer_count(256) - 1) <= 0)
+
+    test.case("the payload starts past the pointer slots")
+    test.assert(nvfsctz.data_offset(256) == 4 * 9)
+
+    test.case("and a pointer sits four bytes past the one before it")
+    test.assert(nvfsctz.pointer_offset(0) == 0)
+    test.assert(nvfsctz.pointer_offset(2) == 8)
+
+@test
+fn test_capacity_is_uniform_which_makes_offset_to_index_one_division() [io]
+    test.case("a block holds its size less its pointer slots")
+    test.assert(nvfsctz.capacity(512, 256) == 512 - 36)
+
+    test.case("so the index of a byte is a division")
+    test.assert(nvfsctz.index_of_offset(1000, 480) == 2)
+    test.assert(nvfsctz.index_of_offset(0, 480) == 0)
+    test.assert(nvfsctz.index_of_offset(479, 480) == 0)
+    test.assert(nvfsctz.index_of_offset(480, 480) == 1)
+
+    test.case("and the offset inside that block is the remainder")
+    test.assert(nvfsctz.offset_in_block(1000, 480) == 40)
+    test.assert(nvfsctz.offset_in_block(480, 480) == 0)
+
+@test
+fn test_a_file_occupies_the_blocks_its_size_needs_and_no_more() [io]
+    test.case("an empty file occupies none, which is why it lives inline")
+    test.assert(nvfsctz.block_count_for(0, 480) == 0)
+
+    test.case("one byte occupies one")
+    test.assert(nvfsctz.block_count_for(1, 480) == 1)
+
+    test.case("exactly one block's worth still occupies one")
+    test.assert(nvfsctz.block_count_for(480, 480) == 1)
+
+    test.case("one more byte occupies two")
+    test.assert(nvfsctz.block_count_for(481, 480) == 2)
+
+    test.case("and the last index is one less than the count")
+    test.assert(nvfsctz.last_index(1000, 480) == nvfsctz.block_count_for(1000, 480) - 1)
+
+@test
+fn test_the_seek_is_logarithmic_and_the_number_says_so() [io]
+    // A skip list whose seek is linear is still correct, and is the bug
+    // this case exists to catch.
+    test.case("a seek to the block the walk is already on costs nothing")
+    test.assert(nvfsctz.seek_reads(9, 9, 9) == 0)
+
+    test.case("a seek back one index costs one read")
+    test.assert(nvfsctz.seek_reads(9, 8, 9) == 1)
+
+    test.case("a hundred thousand blocks seek in at most seventeen reads")
+    test.assert(nvfsctz.seek_reads(99999, 0, nvfsctz.pointer_count(100000)) <= 17)
+
+    test.case("which is fewer than a walk of the chain would take")
+    test.assert(nvfsctz.seek_reads(99999, 0, nvfsctz.pointer_count(100000)) < 99999)
+
+@test
+fn test_a_walk_is_three_integers_and_a_jump_at_a_time() [io]
+    test.case("a fresh walk stands on the head at the head's index")
+    let w = nvfsctz.walk(41, 9, 1)
+    test.assert(nvfsctz.walk_block(w) == 41)
+    test.assert(nvfsctz.walk_index(w) == 9)
+    test.assert(nvfsctz.walk_done(w) == false)
+
+    test.case("a walk that has arrived has arrived")
+    test.assert(nvfsctz.walk_done(nvfsctz.walk(41, 9, 9)))
+
+    test.case("the jump it asks for does not overshoot its target")
+    let j = nvfsctz.walk_jump(w, 9)
+    test.assert(nvfsctz.pointer_target(9, j) >= 1)
+
+    test.case("and an arrived walk asks for no jump at all")
+    test.assert(nvfsctz.walk_jump(nvfsctz.walk(41, 9, 9), 9) == 0 - 1)
+
+    test.case("stepping moves the walk closer")
+    let stepped = nvfsctz.walk_step(w, j, 33)
+    test.assert(nvfsctz.walk_block(stepped) == 33)
+    test.assert(nvfsctz.walk_index(stepped) < nvfsctz.walk_index(w))
+    test.assert(nvfsctz.walk_index(stepped) >= 1)
+
+@test
+fn test_a_corrupt_pointer_is_caught_before_it_reads_block_four_billion() [io]
+    // A chain is the one structure in this format a bad pointer can
+    // send off the end of the device.
+    test.case("a block inside the device is plausible")
+    test.assert(nvfsctz.pointer_is_plausible(33, 256))
+
+    test.case("one past the end is not")
+    test.assert(nvfsctz.pointer_is_plausible(256, 256) == false)
+
+    test.case("and neither is the absent marker, which is what an unwritten slot reads as")
+    test.assert(nvfsctz.pointer_is_plausible(nvfsctz.absent_pointer(), 256) == false)
+
+    test.case("the absent marker is the erased word, so a slot needs no second pass")
+    test.assert(nvfsctz.absent_pointer() == 4294967295)
+
+@test
+fn test_a_small_file_costs_no_data_block_at_all() [io]
+    test.case("at or below the threshold, a file is inline")
+    test.assert(nvfsctz.is_inline(64, 128))
+    test.assert(nvfsctz.is_inline(128, 128))
+
+    test.case("past it, it is a chain")
+    test.assert(nvfsctz.is_inline(129, 128) == false)
+
+    test.case("and an empty file is always inline")
+    test.assert(nvfsctz.is_inline(0, 128))
+
+@test
+fn test_a_shrink_reuses_the_chain_prefix_because_a_prefix_is_a_chain() [io]
+    // The one place this format is cheaper than a rewrite, and worth
+    // publishing so a caller can tell the cheap shrink from the
+    // expensive one.
+    test.case("a shrink that stays a chain reuses its prefix")
+    test.assert(nvfsctz.shrink_reuses_prefix(1000, 500, 480, 128))
+
+    test.case("a shrink into the inline range does not — it becomes a different kind")
+    test.assert(nvfsctz.shrink_reuses_prefix(1000, 64, 480, 128) == false)
+
+    test.case("and an EXTENSION is not a shrink")
+    test.assert(nvfsctz.shrink_reuses_prefix(500, 1000, 480, 128) == false)

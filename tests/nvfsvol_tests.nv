@@ -1,0 +1,270 @@
+// nvfsvol_tests.nv — what a record means: the superblock, the entries,
+// and the fold.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfsvol.<fn>`.
+//
+// THE FOLD IS THE SUITE.  A directory has no index — its live state is
+// its log folded in order — so the interesting cases are all about
+// order: an entry rewritten, an entry removed and put back, a rename
+// over a name that a tombstone removed earlier in the same log.  Every
+// one of them is a sequence of records and an expected entry list, and
+// none of them needs a device.
+//
+// THE RENAME IS ONE RECORD, and the case below says why that matters:
+// a rename written as a tombstone plus an entry is two commits, and a
+// power cut between them loses the file entirely.
+
+use std.test
+use std.bytes
+use std.list
+use nvfsmeta
+use nvfsvol
+
+fn entry_record(e: nvfsvol.NvfsEntry) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_entry(), nvfsvol.encode_entry(e))
+
+fn tombstone_record(name: Str) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_tombstone(), nvfsvol.encode_tombstone(name))
+
+fn rename_record(old_name: Str, new_name: Str) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_rename(), nvfsvol.encode_rename(old_name, new_name))
+
+@test
+fn test_the_four_record_types_are_distinct_and_none_is_the_reserved_one() [io]
+    test.case("the four types")
+    test.assert(nvfsvol.record_type_superblock() == 1)
+    test.assert(nvfsvol.record_type_entry() == 2)
+    test.assert(nvfsvol.record_type_tombstone() == 3)
+    test.assert(nvfsvol.record_type_rename() == 4)
+
+    test.case("and none of them is 0xFF, which erased flash reads as")
+    test.assert(nvfsvol.record_type_superblock() != 255)
+    test.assert(nvfsvol.record_type_rename() != 255)
+
+@test
+fn test_a_directory_is_its_log_folded_in_order() [io]
+    test.case("an empty log is an empty directory")
+    test.assert(list.len(nvfsvol.fold([])) == 0)
+
+    test.case("one entry record is one entry")
+    let boot = nvfsvol.inline_entry("boot", bytes.from_byte_list([1]))
+    test.assert(list.len(nvfsvol.fold([entry_record(boot)])) == 1)
+
+    test.case("a second record for the same name REPLACES the first")
+    let boot2 = nvfsvol.inline_entry("boot", bytes.from_byte_list([1, 2]))
+    let replaced = nvfsvol.fold([entry_record(boot), entry_record(boot2)])
+    test.assert(list.len(replaced) == 1)
+    match nvfsvol.find(replaced, "boot")
+        None    => test.assert(false)
+        Some(e) => test.assert(nvfsvol.entry_size(e) == 2)
+
+    test.case("a tombstone removes")
+    test.assert(list.len(nvfsvol.fold([entry_record(boot), tombstone_record("boot")])) == 0)
+
+    test.case("and an entry after a tombstone brings the name back")
+    let back = nvfsvol.fold([entry_record(boot), tombstone_record("boot"), entry_record(boot)])
+    test.assert(list.len(back) == 1)
+
+    test.case("a tombstone for a name nothing has changes nothing")
+    test.assert(list.len(nvfsvol.fold([tombstone_record("absent")])) == 0)
+
+@test
+fn test_a_rename_is_one_record_which_is_why_a_power_cut_cannot_lose_the_file() [io]
+    // Written as a tombstone plus an entry it would be two commits, and
+    // a cut between them would leave neither name.
+    test.case("a rename moves the entry and keeps what it held")
+    let big = nvfsvol.chain_entry("big", 41, 4096)
+    let renamed = nvfsvol.fold([entry_record(big), rename_record("big", "bigger")])
+    test.assert(list.len(renamed) == 1)
+    match nvfsvol.find(renamed, "bigger")
+        None    => test.assert(false)
+        Some(e) => test.assert(nvfsvol.entry_size(e) == 4096)
+
+    test.case("the old name is gone")
+    match nvfsvol.find(renamed, "big")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("a rename of a name nothing has changes nothing")
+    test.assert(list.len(nvfsvol.fold([rename_record("absent", "other")])) == 0)
+
+@test
+fn test_only_a_same_directory_rename_is_one_this_format_can_commit() [io]
+    test.case("two names in one directory")
+    test.assert(nvfsvol.same_parent("/a/b", "/a/c"))
+
+    test.case("two names in different directories")
+    test.assert(nvfsvol.same_parent("/a/b", "/x/c") == false)
+
+    test.case("and two at different depths")
+    test.assert(nvfsvol.same_parent("/a/b", "/a/c/d") == false)
+
+@test
+fn test_the_three_entry_kinds_hold_three_different_things_in_two_words() [io]
+    test.case("a directory's words are its metadata pair")
+    let dir = nvfsvol.directory_entry("logs", 4, 5)
+    test.assert(dir.word_first == 4)
+    test.assert(dir.word_second == 5)
+    test.assert(nvfsvol.entry_is_directory(dir))
+    test.assert(nvfsvol.entry_size(dir) == 0)
+
+    test.case("a chain's words are its head and its size")
+    let chained = nvfsvol.chain_entry("big", 41, 4096)
+    test.assert(chained.word_first == 41)
+    test.assert(nvfsvol.entry_size(chained) == 4096)
+    test.assert(nvfsvol.entry_is_directory(chained) == false)
+
+    test.case("an inline file's size is the length of what it holds")
+    test.assert(nvfsvol.entry_size(nvfsvol.inline_entry("boot", bytes.from_byte_list([1, 2, 3]))) == 3)
+
+@test
+fn test_a_dirent_that_cannot_name_real_blocks_is_caught_before_the_walk() [io]
+    // The one check that stops a damaged directory from sending a read
+    // off the end of the part.
+    test.case("a plausible pair")
+    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 5), 32))
+
+    test.case("a pair whose two blocks are the same is not a pair")
+    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 4), 32) == false)
+
+    test.case("a pair past the end of the device")
+    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 99), 32) == false)
+
+@test
+fn test_an_entry_round_trips_through_its_record_payload() [io]
+    test.case("a directory entry")
+    match nvfsvol.decode_entry(nvfsvol.encode_entry(nvfsvol.directory_entry("logs", 4, 5)))
+        None    => test.assert(false)
+        Some(e) =>
+            test.assert(e.name == "logs")
+            test.assert(e.word_first == 4)
+
+    test.case("an inline file, contents and all")
+    let boot = nvfsvol.inline_entry("boot", bytes.from_byte_list([7, 8]))
+    match nvfsvol.decode_entry(nvfsvol.encode_entry(boot))
+        None    => test.assert(false)
+        Some(e) => test.assert(nvfsvol.entry_size(e) == 2)
+
+    test.case("and a payload too short to be an entry answers None")
+    match nvfsvol.decode_entry(bytes.zeros(1))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_a_superblock_round_trips_and_refuses_what_it_should() [io]
+    let g = nvfsvol.geometry(16, 16, 512, 32)
+
+    test.case("the geometry a format wrote comes back")
+    match nvfsvol.decode_superblock(nvfsvol.encode_superblock(g, nvfsvol.default_config()))
+        Err(_) => test.assert(false)
+        Ok(sb) =>
+            test.assert(sb.block_size == 512)
+            test.assert(sb.block_count == 32)
+
+    test.case("and it matches the device it was written for")
+    match nvfsvol.decode_superblock(nvfsvol.encode_superblock(g, nvfsvol.default_config()))
+        Err(_) => test.assert(false)
+        Ok(sb) => test.assert(nvfsvol.geometry_matches(sb, g))
+
+    test.case("but not a device with different blocks")
+    match nvfsvol.decode_superblock(nvfsvol.encode_superblock(g, nvfsvol.default_config()))
+        Err(_) => test.assert(false)
+        Ok(sb) => test.assert(nvfsvol.geometry_matches(sb, nvfsvol.geometry(16, 16, 4096, 32)) == false)
+
+    test.case("a payload with the wrong magic is refused as corrupt")
+    match nvfsvol.decode_superblock(bytes.zeros(32))
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                NvfsCorrupt => test.assert(true)
+                _           => test.assert(false)
+
+@test
+fn test_only_the_root_pairs_log_carries_a_superblock() [io]
+    test.case("a subdirectory's log has none")
+    match nvfsvol.find_superblock([entry_record(nvfsvol.directory_entry("logs", 4, 5))])
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("the root's does, and it is what a compaction must preserve")
+    let g = nvfsvol.geometry(16, 16, 512, 32)
+    let sb = nvfsmeta.record(nvfsvol.record_type_superblock(),
+                             nvfsvol.encode_superblock(g, nvfsvol.default_config()))
+    match nvfsvol.find_superblock([sb])
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("a compaction of an empty subdirectory keeps nothing")
+    test.assert(list.len(nvfsvol.compaction_records([])) == 0)
+
+    test.case("a compaction of the root keeps its superblock")
+    test.assert(list.len(nvfsvol.compaction_records([sb])) == 1)
+
+    test.case("and a name written twice compacts to ONE record")
+    let boot = nvfsvol.inline_entry("boot", bytes.from_byte_list([1]))
+    test.assert(list.len(nvfsvol.compaction_records([entry_record(boot), entry_record(boot)])) == 1)
+
+    test.case("while a name that was removed compacts to none")
+    test.assert(list.len(nvfsvol.compaction_records([entry_record(boot), tombstone_record("boot")])) == 0)
+
+@test
+fn test_a_path_splits_the_same_way_however_it_is_written() [io]
+    test.case("empty components are dropped")
+    test.assert(nvfsvol.path_components("/a//b/") == ["a", "b"])
+    test.assert(nvfsvol.path_components("a/b") == ["a", "b"])
+
+    test.case("the root has no components")
+    test.assert(list.len(nvfsvol.path_components("/")) == 0)
+
+    test.case("and the basename is the last one")
+    test.assert(nvfsvol.basename("/a/b") == "b")
+    test.assert(nvfsvol.basename("/") == "")
+
+@test
+fn test_a_name_is_checked_against_the_superblocks_bound_not_the_running_one() [io]
+    // The bound is an on-disk contract: a reader with a larger setting
+    // must not write a name an older reader cannot hold.
+    test.case("an ordinary name")
+    test.assert(nvfsvol.name_is_valid("boot", 64))
+
+    test.case("an empty one is not a name")
+    test.assert(nvfsvol.name_is_valid("", 64) == false)
+
+    test.case("one holding a separator is not a name either")
+    test.assert(nvfsvol.name_is_valid("a/b", 64) == false)
+
+    test.case("and one past the bound is refused")
+    test.assert(nvfsvol.name_is_valid("abcdef", 4) == false)
+
+@test
+fn test_a_configuration_is_refused_with_the_reason_it_was_refused_for() [io]
+    let g = nvfsvol.geometry(16, 16, 512, 32)
+
+    test.case("the default configuration fits a reasonable device")
+    match nvfsvol.check_config(nvfsvol.default_config(), g)
+        NvfsOk => test.assert(true)
+        _      => test.assert(false)
+
+    test.case("the default is a sensible one to start from")
+    test.assert(nvfsvol.default_config().inline_max > 0)
+    test.assert(nvfsvol.default_config().name_max > 0)
+    test.assert(nvfsvol.default_config().file_max > 0)
+
+    test.case("a name bound past 255 cannot be stored in a byte")
+    let wide = nvfsvol.config(100, 256, 4096, 64)
+    match nvfsvol.check_config(wide, g)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("and a relocation threshold of zero would erase the part")
+    let churning = nvfsvol.config(0, 64, 4096, 64)
+    match nvfsvol.check_config(churning, g)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("a geometry keeps the four numbers it was given")
+    test.assert(g.read_size == 16)
+    test.assert(g.prog_size == 16)
+    test.assert(g.block_size == 512)
+    test.assert(g.block_count == 32)

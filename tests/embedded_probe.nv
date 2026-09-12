@@ -1,0 +1,155 @@
+// embedded_probe.nv — this package's device claim, as a program that
+// either builds for a Cortex-M or does not.
+//
+// It is not a test.  `scripts/shard_audit.sh`'s `core-embedded` row
+// copies it and the modules it names into a package of its own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.
+//
+// WHY THE CLAIM IS THE POINT OF THIS PACKAGE.  `orbit/novofs` is an
+// `app`: its filesystem calls a `Flash` trait whose every method is
+// `[io, hw, mutate]`, so the filesystem itself is charged those effects
+// and the arithmetic that decides where a record goes cannot be reached
+// without a device behind it.  Splitting the state machine out is
+// exactly the move that makes the arithmetic linkable on its own, and
+// this probe is the proof that it worked.
+//
+// WHAT THE CLAIM COVERS: `nvfsgeo`, `nvfsctz` and `nvfswear` — the
+// layout arithmetic, the skip-list walk and the wear and arbitration
+// rules.  Those three are what a firmware runs in a loop: seek into a
+// file, decide whether a commit fits, pick a free block, arbitrate a
+// pair.  Between them they own two `@value` structs of three `Int`s
+// each and no other type at all, so a device does all of it in its own
+// stack frame.
+//
+// WHAT IT DOES NOT COVER, and the honest form of the claim is saying
+// so: `nvfsmeta`, `nvfsvol` and `nvfsop` are NOT in the probe and are
+// not claimed.  A record holds `Bytes`, a directory fold builds a list
+// of entries, and the machine holds an action whose payload is a
+// buffer — every one of them allocates by construction and not by
+// accident.  A firmware that wants those wants a heap; a firmware that
+// wants to walk a chain and commit a record into a buffer it already
+// owns wants exactly the three modules below.
+//
+// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be,
+// and saying so is more useful than pretending otherwise: every body
+// under `src/` is a `todo()`, so what links today is the SIGNATURES and
+// the types — `Int`s in and out, and two `@value` structs passed and
+// returned whole.  There is no walk in the binary yet, so this does not
+// prove a seek is allocation-free; it proves that nothing in the shape
+// of the surface needs an allocator or a host.  Keeping it green once
+// the bodies land is a named cost of the implementation step.
+
+use nvfsctz
+use nvfsgeo
+use nvfswear
+
+// Every answer this probe checks, folded into one number so a single
+// comparison decides the run.  A firmware image has one line of output;
+// making it depend on all of them is what stops a passing run from
+// meaning "the first call linked".
+@tier(rt)
+fn score() -> Int
+    var n = 0
+
+    // ── The layout arithmetic ────────────────────────────────────
+    // The erased byte, which is why 0xFF is a reserved record type.
+    if nvfsgeo.erased_byte() == 255
+        n = n + 1
+    if nvfsgeo.reserved_record_type() == 255
+        n = n + 1
+    // Records start on their own prog page: the one fact the whole
+    // power-loss story rests on.
+    if nvfsgeo.meta_offset(256) == 256
+        n = n + 1
+    if nvfsgeo.meta_offset(1) == 4
+        n = n + 1
+    // A record is four of header, the payload, four of CRC.
+    if nvfsgeo.record_size(32) == 40
+        n = n + 1
+    // And it costs a whole number of prog pages on disk.
+    if nvfsgeo.record_span(32, 16) == 48
+        n = n + 1
+    if nvfsgeo.align_up(9, 4) == 12
+        n = n + 1
+    // The root pair is anchored and never relocates.
+    if nvfsgeo.root_pair_first() == 0
+        n = n + 1
+    if nvfsgeo.root_pair_second() == 1
+        n = n + 1
+    // A usable geometry answers the zero of the error enum.
+    match nvfsgeo.check_geometry(16, 16, 512, 32)
+        NvfsOk =>
+            n = n + 1
+        _      =>
+            n = n + 0
+
+    // ── The skip-list walk, as a value in this frame ─────────────
+    let capacity = nvfsctz.capacity(512, 256)
+    if capacity > 0
+        n = n + 1
+    if nvfsctz.index_of_offset(1000, 480) == 2
+        n = n + 1
+    if nvfsctz.offset_in_block(1000, 480) == 40
+        n = n + 1
+    if nvfsctz.block_count_for(1000, 480) == 3
+        n = n + 1
+    // The walk: built here, stepped, and read back.  This is the shape
+    // a firmware seek has, and the one that has to work with no heap.
+    let w0 = nvfsctz.walk(41, 9, 1)
+    if nvfsctz.walk_block(w0) == 41
+        n = n + 1
+    if nvfsctz.walk_done(w0) == false
+        n = n + 1
+    let jump = nvfsctz.walk_jump(w0, 9)
+    if jump >= 0
+        n = n + 1
+    let w1 = nvfsctz.walk_step(w0, jump, 33)
+    if nvfsctz.walk_index(w1) < nvfsctz.walk_index(w0)
+        n = n + 1
+    if nvfsctz.pointer_is_plausible(33, 256)
+        n = n + 1
+
+    // ── The wear and arbitration rules ───────────────────────────
+    if nvfswear.first_allocatable() == 2
+        n = n + 1
+    // Arbitration: the higher sealed revision wins.
+    if nvfswear.winner(3, true, 4, true) == 1
+        n = n + 1
+    if nvfswear.revision_is_sealed(nvfsgeo.erased_word()) == false
+        n = n + 1
+    // A torn block is full whatever space it appears to have.
+    if nvfswear.append_allowed(true, 512, 48, 4096) == false
+        n = n + 1
+    if nvfswear.append_allowed(false, 512, 48, 4096)
+        n = n + 1
+    // The allocation cursor, as a value in this frame.
+    let a0 = nvfswear.alloc(2)
+    if nvfswear.alloc_candidate(a0, 256) == 2
+        n = n + 1
+    let a1 = nvfswear.alloc_take(a0, 256)
+    if nvfswear.alloc_taken(a1) == 1
+        n = n + 1
+    // -1 stores as 0, because the superblock field is a u32.
+    if nvfswear.encode_block_cycles(0 - 1) == 0
+        n = n + 1
+    if nvfswear.decode_block_cycles(0) == 0 - 1
+        n = n + 1
+    n
+
+@tier(rt)
+fn main() [hw, time]
+    bsp.board.init()
+    // 27 is the number of checks in `score` on the path a linked build
+    // takes.  The count is printed on a failure rather than only
+    // compared, so a device that disagrees with the host says HOW MANY
+    // it lost and a bisect has somewhere to start.
+    let n = score()
+    if n == 27
+        hal.uart.write("PASS: nvfs-core-embedded\n")
+    else
+        hal.uart.write("FAIL: nvfs-core-embedded\n")
+    loop
+        core.rt.sleep_ms(1000)

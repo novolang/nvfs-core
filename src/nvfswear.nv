@@ -1,0 +1,380 @@
+// nvfswear.nv — wear levelling and power-loss resilience, as rules
+// over block numbers.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS PART OF THE DEVICE CLAIM.  Allocation is a cursor and
+// a comparison, arbitration is two revision words and a `>`, and the
+// relocation threshold is a modulo.  `NvfsAlloc` is three `Int`s in a
+// `@value` struct, so a firmware picks a free block with nothing on the
+// heap.
+//
+// THE THREE POWER-LOSS RULES, WRITTEN AS PREDICATES, because they are
+// the part of a flash filesystem that is easy to describe and easy to
+// get wrong, and a rule nobody can call is a rule nobody checks:
+//
+//   1. A COMPACTION SEALS THE REVISION WORD LAST, on its own prog page.
+//      Every record is programmed first; the revision word makes them
+//      visible.  A cut before the seal leaves the sibling's revision
+//      erased and the old block still winning; a cut after it leaves a
+//      block complete by construction.  `seal_offset`, `seal_span` and
+//      `revision_is_sealed`.
+//   2. A TORN APPEND ENDS THE LOG AND MARKS THE BLOCK FULL.  NOR
+//      programming only clears bits, so a garbage tail cannot be
+//      reprogrammed reliably; the next commit must go through a
+//      compaction to the sibling.  `append_allowed`.
+//   3. ALLOCATION IS DEFINED AS "NOT REACHED FROM THE ROOT", never as
+//      a free list.  A crash between allocating a block and committing
+//      the record that references it leaves the block unreachable, and
+//      unreachable is free — so the crash costs nothing and there is no
+//      stale list to repair.  The rotating cursor is a WEAR POLICY on
+//      top of that, and `alloc_*` is only the cursor: changing the pick
+//      order can waste a block and can never corrupt a volume.
+//
+// THE CURSOR IS SEEDED FROM THE REVISION, which is the one line of
+// this module that is about wear rather than about correctness.  A
+// device that started allocating at block 2 on every boot would erase
+// the low blocks of the part a thousand times before touching the high
+// ones.  Seeding from the mounted revision spreads successive boots
+// across the device, and because the seed only moves where the scan
+// STARTS, a wrong seed costs a longer scan and never a wrong answer.
+
+// A rotating allocation cursor, mid-scan.
+//
+// Three integers: where to look next, how far the scan has come, and
+// how many blocks it has taken.  The scan is bounded by the block
+// count, so a full device answers "no space" rather than looping.
+pub @value
+struct NvfsAlloc
+    // The next block to consider.
+    cursor: Int
+    // How many candidates have been considered, so a full wrap is
+    // detectable without remembering where the scan began.
+    scanned: Int
+    // How many blocks this allocation has taken so far.
+    taken: Int
+
+// The first block a file or a subdirectory may be allocated on.
+//
+// Two: blocks 0 and 1 are the superblock pair, which is also the root
+// directory and never moves.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.first_allocatable()}")
+// ```
+pub fn first_allocatable() -> Int []
+    todo("nvfs-core.nvfswear.first_allocatable")
+
+// Where the cursor should start, given the revision a mount found.
+//
+// A wear policy and nothing else: it moves where the scan begins, so a
+// bad answer costs a longer scan and can never hand out a live block.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.cursor_seed(7, 256)}")
+// ```
+pub fn cursor_seed(revision: Int, block_count: Int) -> Int []
+    todo("nvfs-core.nvfswear.cursor_seed")
+
+// A fresh allocation scan starting at a cursor.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_candidate(nvfswear.alloc(2), 256)}")
+// ```
+pub fn alloc(cursor: Int) -> NvfsAlloc []
+    todo("nvfs-core.nvfswear.alloc")
+
+// The block this scan is looking at, normalised into range.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_candidate(nvfswear.alloc(300), 256)}")
+// ```
+pub fn alloc_candidate(a: NvfsAlloc, block_count: Int) -> Int []
+    todo("nvfs-core.nvfswear.alloc_candidate")
+
+// The scan after taking the block it was looking at.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_taken(nvfswear.alloc_take(nvfswear.alloc(2), 256))}")
+// ```
+pub fn alloc_take(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
+    todo("nvfs-core.nvfswear.alloc_take")
+
+// The scan after rejecting the block it was looking at — because it is
+// reachable from the root, or because it has been retired.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_candidate(nvfswear.alloc_skip(nvfswear.alloc(2), 256), 256)}")
+// ```
+pub fn alloc_skip(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
+    todo("nvfs-core.nvfswear.alloc_skip")
+
+// How many blocks this scan has taken.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_taken(nvfswear.alloc(2))}")
+// ```
+pub fn alloc_taken(a: NvfsAlloc) -> Int []
+    todo("nvfs-core.nvfswear.alloc_taken")
+
+// Whether the scan has been all the way round without finding enough.
+//
+// The bound that turns a full device into `NvfsNoSpace` rather than a
+// loop, and the reason `scanned` is a field: a wrapped cursor cannot be
+// told from a fresh one by its value alone.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_exhausted(nvfswear.alloc(2), 256)}")
+// ```
+pub fn alloc_exhausted(a: NvfsAlloc, block_count: Int) -> Bool []
+    todo("nvfs-core.nvfswear.alloc_exhausted")
+
+// The cursor to remember for the next allocation.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.alloc_cursor(nvfswear.alloc(2))}")
+// ```
+pub fn alloc_cursor(a: NvfsAlloc) -> Int []
+    todo("nvfs-core.nvfswear.alloc_cursor")
+
+// Which of a pair's two blocks wins: 0, 1, or -1 when neither is
+// valid.
+//
+// The whole of arbitration.  A block with a sealed revision word takes
+// part; of two that do, the higher revision wins; a tie goes to the
+// first, which is what makes `format` writing block 0 at revision 1 a
+// complete filesystem.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.winner(3, true, 4, true)}")    // 1
+// ```
+pub fn winner(revision_first: Int, valid_first: Bool, revision_second: Int,
+              valid_second: Bool) -> Int []
+    todo("nvfs-core.nvfswear.winner")
+
+// Whether a revision word has been programmed — that is, whether the
+// block it heads is complete.
+//
+// The erased word is not a revision, which is rule 1 read backwards: a
+// compaction interrupted before its seal leaves exactly this.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.revision_is_sealed(1)}")
+// ```
+pub fn revision_is_sealed(word: Int) -> Bool []
+    todo("nvfs-core.nvfswear.revision_is_sealed")
+
+// The revision a compaction into the sibling should carry.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.next_revision(7)}")
+// ```
+pub fn next_revision(revision: Int) -> Int []
+    todo("nvfs-core.nvfswear.next_revision")
+
+// Whether a revision is close enough to wrapping that a driver should
+// say so.
+//
+// The u32 revision is a documented deferral — at one compaction a
+// second it wraps in about 136 years — and a deferral nobody can
+// detect is a deferral nobody will notice.  A long-lived logger can ask.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.revision_near_wrap(7)}")
+// ```
+pub fn revision_near_wrap(revision: Int) -> Bool []
+    todo("nvfs-core.nvfswear.revision_near_wrap")
+
+// Where a compaction programs the revision word.
+//
+// Zero, and it is programmed LAST.  Published as a function because the
+// ordering is the property, and a driver that wrote the seal first
+// would produce a volume that mounts and has no records in it.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.seal_offset()}")
+// ```
+pub fn seal_offset() -> Int []
+    todo("nvfs-core.nvfswear.seal_offset")
+
+// How many bytes the seal program writes: one prog page, padded.
+//
+// A whole page, because a partial page program would let a later write
+// share it and a shared page is the one thing rule 1 forbids.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.seal_span(256)}")
+// ```
+pub fn seal_span(prog_size: Int) -> Int []
+    todo("nvfs-core.nvfswear.seal_span")
+
+// Whether one more record may be APPENDED to a log, rather than
+// forcing a compaction.
+//
+// Rule 2, as a predicate: a torn block is full whatever space it
+// appears to have, because NOR programming only clears bits and the
+// garbage tail cannot be rewritten.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.append_allowed(false, 512, 48, 4096)}")
+//     println("${nvfswear.append_allowed(true, 512, 48, 4096)}")   // false
+// ```
+pub fn append_allowed(torn: Bool, end_offset: Int, span: Int, block_size: Int) -> Bool []
+    todo("nvfs-core.nvfswear.append_allowed")
+
+// Whether a metadata pair has compacted often enough to be moved to
+// fresh blocks.
+//
+// Every compaction bumps the revision, so the revision IS the erase
+// count of the pair, and the threshold is one modulo.  A directory
+// rewritten a thousand times a day would otherwise wear two blocks out
+// while the rest of the part stayed new.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.should_relocate(100, 100)}")
+// ```
+pub fn should_relocate(revision: Int, block_cycles: Int) -> Bool []
+    todo("nvfs-core.nvfswear.should_relocate")
+
+// Whether relocation is switched off for this volume.
+//
+// `-1` means never relocate, which is what an image built once and
+// read many times wants: the wear policy costs erases, and a
+// read-mostly volume pays them for nothing.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.relocation_disabled(0 - 1)}")
+// ```
+pub fn relocation_disabled(block_cycles: Int) -> Bool []
+    todo("nvfs-core.nvfswear.relocation_disabled")
+
+// `block_cycles` as the superblock stores it.
+//
+// `-1` stores as `0`, because the field is a u32 and cannot carry a
+// negative.  A pair of functions rather than one convention, so the
+// encoding is checkable and a volume written by one and read by the
+// other cannot disagree.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.encode_block_cycles(0 - 1)}")   // 0
+// ```
+pub fn encode_block_cycles(block_cycles: Int) -> Int []
+    todo("nvfs-core.nvfswear.encode_block_cycles")
+
+// `block_cycles` as read back out of the superblock.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.decode_block_cycles(0)}")       // -1
+// ```
+pub fn decode_block_cycles(stored: Int) -> Int []
+    todo("nvfs-core.nvfswear.decode_block_cycles")
+
+// Whether a `block_cycles` setting is one a volume may be formatted
+// with.
+//
+// Zero is refused: it would relocate on every commit, which is not a
+// wear policy but a way to erase a part quickly.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.block_cycles_valid(0)}")        // false
+// ```
+pub fn block_cycles_valid(block_cycles: Int) -> Bool []
+    todo("nvfs-core.nvfswear.block_cycles_valid")
+
+// Whether a block that failed an erase or a program should be retired
+// for the rest of this session.
+//
+// Retirement is in MEMORY and not on disk, deliberately, and the cost
+// is stated rather than hidden: a block retired after a failed erase
+// becomes a candidate again on the next mount, so a genuinely dead
+// block is rediscovered once per boot.  Persisting it would need a
+// record whose own block could be the dead one.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.should_retire(false)}")
+// ```
+pub fn should_retire(operation_succeeded: Bool) -> Bool []
+    todo("nvfs-core.nvfswear.should_retire")
+
+// How many times an allocation retries on fresh blocks before giving
+// up.
+//
+// A failed erase is a worn block rather than a broken device, so the
+// operation is retried elsewhere; three is where `orbit/novofs`
+// settled, and publishing it is what lets a driver's own retry budget
+// agree with this one.
+//
+// ```novo
+// use nvfswear
+//
+// fn main() [io]
+//     println("${nvfswear.allocation_attempts()}")
+// ```
+pub fn allocation_attempts() -> Int []
+    todo("nvfs-core.nvfswear.allocation_attempts")

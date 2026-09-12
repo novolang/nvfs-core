@@ -1,0 +1,342 @@
+// nvfsgeo.nv — the geometry a volume was formatted for, as arithmetic.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS PART OF THE DEVICE CLAIM, with `nvfsctz` and
+// `nvfswear`.  Every function takes integers and answers integers, no
+// type here owns a buffer, and nothing calls anything outside the
+// language — which is what lets a firmware link it with no heap and no
+// host.
+//
+// WHY THE LAYOUT IS ARITHMETIC RATHER THAN A STRUCT WALK.  A metadata
+// block is
+//
+//     [ revision u32 | pad to meta_offset | record | record | 0xFF … ]
+//     meta_offset = max(4, prog_size)
+//     record      = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ]
+//
+// and every question a driver asks about it — where does the next
+// record go, does this one fit, is this byte free space or a type —
+// is a division and a comparison.  Publishing them as functions rather
+// than burying them in a scanner is what lets the device half of this
+// package exist at all: a Cortex-M can decide "this append fits" in
+// four instructions and never build a record list.
+//
+// THE PADDING IS THE POWER-LOSS STORY, and `meta_offset` is where it
+// lives.  Records start on their own prog page, so a compaction can
+// program every record and then program the revision word as a
+// separate, final operation.  A cut before that last program leaves the
+// sibling's revision word erased and the old block still winning; a cut
+// after it leaves a block that is complete by construction.  With
+// records packed against the revision word, one prog page could carry
+// both a partial record and a live revision, and neither outcome would
+// be recoverable.  `orbit/novofs` learned this as an on-disk format
+// change that is not backward compatible, and the arithmetic that
+// encodes the lesson is here.
+
+// What went wrong, as one value with no payload — so it crosses the
+// device boundary, fits in a register, and can be compared.
+//
+// littlefs's own error set, with `NvfsOk` as the zero rather than a
+// separate `Result`: a `@value` type cannot be a `Result` payload
+// (SPEC § 14.5), and half the calls in this package answer a state
+// machine step rather than a value, so one error enum used everywhere
+// is the shape that does not fight the tier.
+pub enum NvfsError
+    NvfsOk
+    // A read, program, erase or sync the host reported as failed.
+    NvfsIoFailed
+    // Structure is present and unreadable: a bad CRC where a record
+    // must be, a dirent naming a pair outside the device.
+    NvfsCorrupt
+    // The device is erased.  Not a failure — it is what a fresh part
+    // looks like, and it is how `mount` tells "format me" from
+    // "something ate my filesystem".
+    NvfsNoFilesystem
+    // The superblock's geometry is not the device's.  An image built
+    // for 4 KiB blocks handed to a part with 64 KiB ones.
+    NvfsGeometryMismatch
+    // The on-disk major version is newer than this library.
+    NvfsVersionUnsupported
+    // The configuration does not fit the device: a cache smaller than
+    // a prog page, a block that cannot hold one superblock record.
+    NvfsInvalidConfig
+    NvfsNoSpace
+    NvfsNotFound
+    NvfsExists
+    NvfsNotDirectory
+    NvfsIsDirectory
+    NvfsNotEmpty
+    NvfsNameTooLong
+    // A cross-directory rename, or removing the root.  Named rather
+    // than done unsafely: a cross-directory move is two metadata pairs
+    // committed together, which this format cannot express without
+    // littlefs's global move state.
+    NvfsNotSupported
+
+// The error's own name, for a message or a log line.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println(nvfsgeo.error_name(NvfsNoSpace))
+// ```
+pub fn error_name(e: NvfsError) -> Str []
+    todo("nvfs-core.nvfsgeo.error_name")
+
+// Whether an error is the absence of a filesystem rather than damage
+// to one.
+//
+// The distinction a boot sequence turns on: `NvfsNoFilesystem` means
+// format, and `NvfsCorrupt` means do not.  A driver that treated them
+// alike would reformat a volume whose one bad block was recoverable.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.is_blank(NvfsNoFilesystem)}")
+// ```
+pub fn is_blank(e: NvfsError) -> Bool []
+    todo("nvfs-core.nvfsgeo.is_blank")
+
+// The byte an erased NOR cell reads as.
+//
+// Published because it is the reason `0xFF` is a reserved record type
+// forever, and two spellings of 255 in two files is one place for them
+// to disagree.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.erased_byte()}")
+// ```
+pub fn erased_byte() -> Int []
+    todo("nvfs-core.nvfsgeo.erased_byte")
+
+// The 32-bit word an erased revision field reads as.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.erased_word()}")
+// ```
+pub fn erased_word() -> Int []
+    todo("nvfs-core.nvfsgeo.erased_word")
+
+// The record type nothing may ever use.
+//
+// `0xFF` is what erased flash reads as, so a record claiming it would
+// be indistinguishable from free space.  The scanner steps over runs of
+// it rather than stopping at the first one, because an appended commit
+// starts on a prog boundary and padding-then-record is the normal
+// layout.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.reserved_record_type()}")
+// ```
+pub fn reserved_record_type() -> Int []
+    todo("nvfs-core.nvfsgeo.reserved_record_type")
+
+// The on-disk format version this library writes.
+//
+// Major in the high half, minor in the low: a volume whose major
+// differs is `NvfsVersionUnsupported`, and one whose minor differs
+// mounts.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.format_version()}")
+// ```
+pub fn format_version() -> Int []
+    todo("nvfs-core.nvfsgeo.format_version")
+
+// Whether an on-disk version is one this library can mount.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.version_is_mountable(nvfsgeo.format_version())}")
+// ```
+pub fn version_is_mountable(version: Int) -> Bool []
+    todo("nvfs-core.nvfsgeo.version_is_mountable")
+
+// Byte `index` of the four-byte superblock magic.
+//
+// A function rather than a four-byte constant because a `@value` type
+// cannot own a buffer and a device comparing the magic compares four
+// integers.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.magic_byte(0)}")
+// ```
+pub fn magic_byte(index: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.magic_byte")
+
+// Where a metadata block's records start: `max(4, prog_size)`.
+//
+// Four because the revision word is four bytes; `prog_size` because
+// nothing may share a prog page with that word.  The second reason is
+// the one that matters, and it is the whole of the power-loss
+// argument above.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.meta_offset(256)}")     // 256
+//     println("${nvfsgeo.meta_offset(1)}")       // 4
+// ```
+pub fn meta_offset(prog_size: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.meta_offset")
+
+// `n` rounded up to a multiple of `alignment`.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.align_up(9, 4)}")       // 12
+// ```
+pub fn align_up(n: Int, alignment: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.align_up")
+
+// How many bytes a record with this payload occupies on disk, before
+// padding: four of header, the payload, four of CRC.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.record_size(32)}")      // 40
+// ```
+pub fn record_size(payload_len: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.record_size")
+
+// How many bytes it occupies after padding to a prog page, which is
+// what an append actually costs.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.record_span(32, 16)}")  // 48
+// ```
+pub fn record_span(payload_len: Int, prog_size: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.record_span")
+
+// The largest payload a record may carry in a block of this size.
+//
+// Published because `NvfsNameTooLong` and the inline-file threshold
+// are both bounded by it, and a caller choosing a configuration should
+// be able to ask rather than discover.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.max_payload(4096, 256)}")
+// ```
+pub fn max_payload(block_size: Int, prog_size: Int) -> Int []
+    todo("nvfs-core.nvfsgeo.max_payload")
+
+// Whether one more record of this payload fits after `end_offset`.
+//
+// The four-instruction question a driver asks before every commit; the
+// answer decides between an append and a compaction.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.append_fits(4096, 256, 512, 32)}")
+// ```
+pub fn append_fits(block_size: Int, prog_size: Int, end_offset: Int, payload_len: Int) -> Bool []
+    todo("nvfs-core.nvfsgeo.append_fits")
+
+// Whether a read or program of `len` bytes at `off` in a block is
+// aligned and in range.
+//
+// The device contract as a predicate: offsets and lengths must be
+// multiples of the unit and inside the block, and a violation fails
+// rather than widening.  A driver checks with this instead of each
+// driver inventing its own bounds check.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.access_is_valid(4096, 16, 0, 16)}")
+// ```
+pub fn access_is_valid(block_size: Int, unit: Int, off: Int, len: Int) -> Bool []
+    todo("nvfs-core.nvfsgeo.access_is_valid")
+
+// The first block of the superblock pair, which is also the root
+// directory's.
+//
+// The root IS the superblock pair, exactly as in littlefs, which is
+// why it is anchored at 0 and 1 and never relocates.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.root_pair_first()}")
+// ```
+pub fn root_pair_first() -> Int []
+    todo("nvfs-core.nvfsgeo.root_pair_first")
+
+// The second block of the superblock pair.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.root_pair_second()}")
+// ```
+pub fn root_pair_second() -> Int []
+    todo("nvfs-core.nvfsgeo.root_pair_second")
+
+// Whether a block number is one a metadata pair or a file may be
+// allocated on.
+//
+// Everything but the two the root holds.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println("${nvfsgeo.block_is_allocatable(2, 16)}")
+// ```
+pub fn block_is_allocatable(block: Int, block_count: Int) -> Bool []
+    todo("nvfs-core.nvfsgeo.block_is_allocatable")
+
+// Whether a geometry can carry a filesystem at all, and which error to
+// answer when it cannot.
+//
+// `NvfsOk` for a usable one.  The rules are littlefs's: every unit at
+// least one byte, the block a whole number of prog pages and of read
+// units, at least two blocks for the superblock pair, and a block
+// large enough for its revision page plus one superblock record.
+//
+// ```novo
+// use nvfsgeo
+//
+// fn main() [io]
+//     println(nvfsgeo.error_name(nvfsgeo.check_geometry(16, 16, 512, 32)))
+// ```
+pub fn check_geometry(read_size: Int, prog_size: Int, block_size: Int,
+                      block_count: Int) -> NvfsError []
+    todo("nvfs-core.nvfsgeo.check_geometry")

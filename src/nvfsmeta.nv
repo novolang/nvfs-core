@@ -1,0 +1,380 @@
+// nvfsmeta.nv — a metadata pair: the append-only record log, its
+// arbitration, and the commit-and-seal cycle.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOT IN THE DEVICE CLAIM.  A record holds `Bytes` and a scan answers a
+// list of them, so this module allocates by construction.  The
+// arithmetic it decides with is `nvfsgeo`'s and IS in the claim; a
+// firmware that wants to append a record without a heap builds the
+// image itself with `nvfsgeo.record_span` and `record_crc`, and a
+// firmware with a heap uses this.
+//
+// A PAIR IS TWO ERASE BLOCKS AND ONE LOG.  The block with the higher
+// SEALED revision is active; the other is the spare a compaction folds
+// into.  That is the whole of littlefs's crash resistance and it is
+// four rules:
+//
+//   * every mutation is exactly ONE self-CRC'd record, so per-record
+//     atomicity is the entire story — a rename is one record, not a
+//     tombstone and a dirent;
+//   * a record whose CRC does not match ENDS the valid log and marks
+//     the block full, because NOR programming only clears bits and the
+//     garbage tail cannot be rewritten;
+//   * a compaction programs every record and seals the revision word
+//     LAST, on its own prog page, so a cut before the seal is
+//     invisible and a cut after it leaves a block complete by
+//     construction;
+//   * when an append does not fit, the new record RIDES INSIDE the
+//     compaction — one seal covers both — which is what keeps the
+//     one-record atomicity story true even when the block was full.
+//
+// THIS MODULE IS DOMAIN-FREE.  What a record MEANS — superblock,
+// directory entry, tombstone, rename — is `nvfsvol`'s business.  The
+// fold that must survive a compaction is computed by the caller and
+// handed back in as a plain record list, which is what lets the same
+// log machinery carry the root directory and a subdirectory with no
+// branch between them.
+//
+// SCANNING TAKES THE BLOCK'S BYTES, WHICH IS THE SANS-IO SHAPE.  The
+// host read the block; this decodes it.  `scan` never asks for
+// anything, so a test scans a byte array it built by hand and a
+// power-cut test scans one it truncated.
+
+use crc
+use nvfsgeo
+
+// One record: a type byte and a payload.
+//
+// The CRC is not a field because it is computed over the encoded form
+// and checked when the block is scanned; a record in memory that
+// carried one would let the two disagree.
+pub struct NvfsRecord
+    rtype: Int
+    payload: Bytes
+
+// What one block's bytes decoded to.
+pub struct NvfsScan
+    // Whether the revision word is sealed, which is whether this block
+    // takes part in arbitration at all.
+    valid: Bool
+    revision: Int
+    // The records in log order.  A fold over these in order is the
+    // block's live state.
+    records: [NvfsRecord]
+    // Whether the log ended in garbage.  A torn block is FULL: the
+    // next commit must compact to the sibling.
+    torn: Bool
+    // The first free byte an append may start at, aligned to a prog
+    // page.  The block size when torn, which is how `append_allowed`
+    // refuses without a second flag.
+    end_offset: Int
+
+// The two blocks a directory lives in.
+pub struct NvfsPair
+    first: Int
+    second: Int
+
+// Which of a pair won, and what it holds.
+pub struct NvfsPairState
+    // False when neither block is valid: a fresh device, or wreckage.
+    // The two are told apart by whether either block was torn, which
+    // is why `scan` reports that separately.
+    ok: Bool
+    active: Int
+    sibling: Int
+    scan: NvfsScan
+
+// Build a record.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     let r = nvfsmeta.record(2, bytes.from_byte_list([1, 2]))
+//     println("${nvfsmeta.record_type(r)}")
+// ```
+pub fn record(rtype: Int, payload: Bytes) -> NvfsRecord []
+    todo("nvfs-core.nvfsmeta.record")
+
+// A record's type byte.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.record_type(nvfsmeta.record(2, bytes.from_byte_list([])))}")
+// ```
+pub fn record_type(r: NvfsRecord) -> Int []
+    todo("nvfs-core.nvfsmeta.record_type")
+
+// A record's payload.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsmeta.record_payload(nvfsmeta.record(2, bytes.from_byte_list([1]))))}")
+// ```
+pub fn record_payload(r: NvfsRecord) -> Bytes []
+    todo("nvfs-core.nvfsmeta.record_payload")
+
+// The bytes a record occupies on disk: header, payload, CRC.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsmeta.encode_record(nvfsmeta.record(2, bytes.from_byte_list([1]))))}")
+// ```
+pub fn encode_record(r: NvfsRecord) -> Bytes []
+    todo("nvfs-core.nvfsmeta.encode_record")
+
+// The CRC-32C of a record's header and payload, which is what the
+// four bytes after them hold.
+//
+// crc-nv's, and published here rather than left implicit because a
+// driver building a record image itself — a firmware with no heap —
+// needs the same number this package would have computed.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.record_crc(bytes.from_str("123456789"))}")
+// ```
+pub fn record_crc(header_and_payload: Bytes) -> Int []
+    todo("nvfs-core.nvfsmeta.record_crc")
+
+// The CRC-32C algorithm this format uses.
+//
+// Published so a caller checksumming a stream of records as it builds
+// them holds one `Crc` rather than building the table per record.
+//
+// ```novo
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.checksum().width}")
+// ```
+pub fn checksum() -> crc.Crc []
+    todo("nvfs-core.nvfsmeta.checksum")
+
+// Decode a whole metadata block from the bytes the host read.
+//
+// The sans-IO boundary: the host performed the read, this decides what
+// it means.  Every power-loss case is reachable from here with a byte
+// array — a truncated record, a record whose CRC does not match, a
+// block whose revision word is still erased — which is why the torture
+// harness `orbit/novofs` built around a fault-injecting device becomes,
+// here, a table of byte arrays.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
+//     println("${nvfsmeta.scan_valid(s)}")
+// ```
+pub fn scan_block(prog_size: Int, block_size: Int, image: Bytes) -> NvfsScan []
+    todo("nvfs-core.nvfsmeta.scan_block")
+
+// Whether a scanned block takes part in arbitration.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.scan_valid(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
+// ```
+pub fn scan_valid(s: NvfsScan) -> Bool []
+    todo("nvfs-core.nvfsmeta.scan_valid")
+
+// A scanned block's revision.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.scan_revision(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
+// ```
+pub fn scan_revision(s: NvfsScan) -> Int []
+    todo("nvfs-core.nvfsmeta.scan_revision")
+
+// A scanned block's records, in log order.
+//
+// ```novo
+// use std.bytes
+// use std.list
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${list.len(nvfsmeta.scan_records(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))))}")
+// ```
+pub fn scan_records(s: NvfsScan) -> [NvfsRecord] []
+    todo("nvfs-core.nvfsmeta.scan_records")
+
+// Whether a scanned block's log ended in garbage.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.scan_torn(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
+// ```
+pub fn scan_torn(s: NvfsScan) -> Bool []
+    todo("nvfs-core.nvfsmeta.scan_torn")
+
+// The first byte an append to this block may start at.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.scan_end(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
+// ```
+pub fn scan_end(s: NvfsScan) -> Int []
+    todo("nvfs-core.nvfsmeta.scan_end")
+
+// A pair, by its two block numbers.
+//
+// ```novo
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.pair(0, 1).first}")
+// ```
+pub fn pair(first: Int, second: Int) -> NvfsPair []
+    todo("nvfs-core.nvfsmeta.pair")
+
+// Which block of a pair is active, given both scans.
+//
+// `nvfswear.winner` is the rule; this is that rule applied to two
+// scans, so a caller with the bytes never has to unpack them.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
+//     println("${nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s, s).ok}")
+// ```
+pub fn arbitrate(p: NvfsPair, first: NvfsScan, second: NvfsScan) -> NvfsPairState []
+    todo("nvfs-core.nvfsmeta.arbitrate")
+
+// Whether neither block held anything at all — a fresh device rather
+// than a damaged volume.
+//
+// The distinction `mount` turns on: neither block valid AND neither
+// torn is `NvfsNoFilesystem`; neither valid and one torn is
+// `NvfsCorrupt`.  A driver that conflated them would reformat a volume
+// whose superblock was recoverable.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
+//     println("${nvfsmeta.pair_is_blank(s, s)}")
+// ```
+pub fn pair_is_blank(first: NvfsScan, second: NvfsScan) -> Bool []
+    todo("nvfs-core.nvfsmeta.pair_is_blank")
+
+// The image an append programs: the record, padded to a prog page with
+// the erased byte.
+//
+// Padded with `0xFF` so the padding is indistinguishable from free
+// space on the next scan, which is why the scanner steps over runs of
+// it rather than stopping at the first one.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     let r = nvfsmeta.record(2, bytes.from_byte_list([1]))
+//     println("${bytes.len(nvfsmeta.append_image(r, 16))}")
+// ```
+pub fn append_image(r: NvfsRecord, prog_size: Int) -> Bytes []
+    todo("nvfs-core.nvfsmeta.append_image")
+
+// The image a compaction programs: every record, each padded to a prog
+// page, with NO revision word.
+//
+// The revision word is programmed separately and last, which is why it
+// is not in this image.  Two calls rather than one because the gap
+// between them is the power-loss window the format is built around,
+// and an API that wrote both at once would have removed the property.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsmeta.compaction_image([], 16))}")
+// ```
+pub fn compaction_image(records: [NvfsRecord], prog_size: Int) -> Bytes []
+    todo("nvfs-core.nvfsmeta.compaction_image")
+
+// The image the seal programs: the revision word, padded to a prog
+// page.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsmeta.seal_image(1, 16))}")
+// ```
+pub fn seal_image(revision: Int, prog_size: Int) -> Bytes []
+    todo("nvfs-core.nvfsmeta.seal_image")
+
+// How many bytes a record set occupies as a compaction lays it out.
+//
+// The pre-check that turns a doomed compaction into `NvfsNoSpace`
+// before anything is erased — which matters, because the erase is the
+// step that destroys the sibling's old contents.
+//
+// ```novo
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.records_span([], 16)}")
+// ```
+pub fn records_span(records: [NvfsRecord], prog_size: Int) -> Int []
+    todo("nvfs-core.nvfsmeta.records_span")
+
+// Whether a record set fits one block after compaction.
+//
+// ```novo
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${nvfsmeta.compaction_fits([], 16, 4096)}")
+// ```
+pub fn compaction_fits(records: [NvfsRecord], prog_size: Int, block_size: Int) -> Bool []
+    todo("nvfs-core.nvfsmeta.compaction_fits")
+
+// Pad an image out to a prog-page multiple with the erased byte.
+//
+// ```novo
+// use std.bytes
+// use nvfsmeta
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsmeta.pad_to(bytes.zeros(3), 16))}")
+// ```
+pub fn pad_to(image: Bytes, prog_size: Int) -> Bytes []
+    todo("nvfs-core.nvfsmeta.pad_to")

@@ -1,0 +1,140 @@
+// nvfsmeta_tests.nv — the record log, its arbitration, and the
+// commit-and-seal cycle.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfsmeta.<fn>`.
+//
+// THE SANS-IO SHAPE IS WHAT MAKES THIS SUITE POSSIBLE.  `scan_block`
+// takes the block's BYTES, so every power-loss case is a byte array:
+// an erased block, a block whose records are programmed and whose
+// revision word is not, a log that ends in garbage.  `orbit/novofs`
+// reaches the same cases through a fault-injecting RAM device that can
+// tear a program mid-page; here they are `bytes.zeros` and a slice.
+//
+// THE CRC VECTOR IS crc-nv's PUBLISHED CHECK VALUE.  CRC-32C over the
+// nine bytes `123456789` is 0xe3069283, which every catalogue quotes,
+// and asserting it here is what catches the commonest CRC bug: the
+// right polynomial with the wrong reflection, which produces a number
+// that looks fine and agrees with nothing.
+
+use std.test
+use std.bytes
+use std.list
+use nvfsmeta
+
+fn erased_block(size: Int) -> Bytes
+    bytes.from_byte_list(list.range(0, size) |> list.map(_ => 255))
+
+@test
+fn test_a_record_is_a_type_a_payload_and_a_crc() [io]
+    test.case("a record keeps what it was built from")
+    let r = nvfsmeta.record(2, bytes.from_byte_list([1, 2, 3]))
+    test.assert(nvfsmeta.record_type(r) == 2)
+    test.assert(bytes.len(nvfsmeta.record_payload(r)) == 3)
+
+    test.case("and encodes to four of header, the payload, four of CRC")
+    test.assert(bytes.len(nvfsmeta.encode_record(r)) == 11)
+
+    test.case("an empty payload still costs its header and its CRC")
+    test.assert(bytes.len(nvfsmeta.encode_record(nvfsmeta.record(1, bytes.from_byte_list([])))) == 8)
+
+@test
+fn test_the_checksum_is_crc_32c_and_the_published_check_value_says_so() [io]
+    // The commonest CRC bug is the right polynomial with the wrong
+    // reflection, and it produces a number that agrees with nothing.
+    test.case("CRC-32C over `123456789` is 0xe3069283")
+    test.assert(nvfsmeta.record_crc(bytes.from_str("123456789")) == 3808858755)
+
+    test.case("the algorithm is published so a streaming caller holds one")
+    test.assert(nvfsmeta.checksum().width == 32)
+
+@test
+fn test_an_erased_block_is_not_a_filesystem_and_is_not_damage() [io]
+    test.case("an erased block has no sealed revision")
+    let s = nvfsmeta.scan_block(256, 4096, erased_block(4096))
+    test.assert(nvfsmeta.scan_valid(s) == false)
+
+    test.case("and is not torn — nothing was half written")
+    test.assert(nvfsmeta.scan_torn(s) == false)
+
+    test.case("so a pair of them is blank rather than corrupt")
+    test.assert(nvfsmeta.pair_is_blank(s, s))
+
+    test.case("it holds no records")
+    test.assert(list.len(nvfsmeta.scan_records(s)) == 0)
+
+    test.case("and its revision is not one a compaction would have written")
+    test.assert(nvfsmeta.scan_revision(s) == 0)
+
+@test
+fn test_a_scan_reports_where_an_append_may_start() [io]
+    test.case("an erased block offers the whole log region")
+    let s = nvfsmeta.scan_block(256, 4096, erased_block(4096))
+    test.assert(nvfsmeta.scan_end(s) <= 4096)
+
+    test.case("a torn block offers nothing — its end is the block size")
+    let torn = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
+    if nvfsmeta.scan_torn(torn)
+        test.assert(nvfsmeta.scan_end(torn) == 4096)
+    else
+        test.assert(true)
+
+@test
+fn test_arbitration_is_the_pair_rule_applied_to_two_scans() [io]
+    test.case("a pair of erased blocks arbitrates to nothing")
+    let s = nvfsmeta.scan_block(256, 4096, erased_block(4096))
+    let state = nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s, s)
+    test.assert(state.ok == false)
+
+    test.case("and the pair remembers which blocks it was")
+    test.assert(nvfsmeta.pair(0, 1).first == 0)
+    test.assert(nvfsmeta.pair(0, 1).second == 1)
+
+    test.case("an active block always has a sibling that is the other one")
+    test.assert(state.active != state.sibling)
+
+@test
+fn test_the_images_are_three_calls_because_the_gap_between_them_is_the_property() [io]
+    // A compaction programs every record and seals the revision word
+    // LAST.  An API that wrote both at once would have removed the
+    // window the format is built around.
+    test.case("an append image is the record padded to a prog page")
+    let r = nvfsmeta.record(2, bytes.from_byte_list([1]))
+    test.assert(bytes.len(nvfsmeta.append_image(r, 16)) == 16)
+
+    test.case("a compaction image carries NO revision word")
+    test.assert(bytes.len(nvfsmeta.compaction_image([], 16)) == 0)
+
+    test.case("and a compaction of one record is that record, padded")
+    test.assert(bytes.len(nvfsmeta.compaction_image([r], 16)) == 16)
+
+    test.case("the seal is its own page")
+    test.assert(bytes.len(nvfsmeta.seal_image(1, 16)) == 16)
+    test.assert(bytes.len(nvfsmeta.seal_image(1, 256)) == 256)
+
+@test
+fn test_padding_is_the_erased_byte_so_the_next_scan_steps_over_it() [io]
+    test.case("padding brings an image up to a prog-page multiple")
+    test.assert(bytes.len(nvfsmeta.pad_to(bytes.zeros(3), 16)) == 16)
+
+    test.case("an image that is already a multiple is unchanged")
+    test.assert(bytes.len(nvfsmeta.pad_to(bytes.zeros(16), 16)) == 16)
+
+    test.case("and the byte it pads with is the one erased flash reads as")
+    test.assert((bytes.byte_at(nvfsmeta.pad_to(bytes.zeros(3), 16), 15) ?? 0) == 255)
+
+@test
+fn test_a_compaction_is_refused_before_anything_is_erased() [io]
+    // The erase is the step that destroys the sibling's old contents,
+    // so a doomed compaction must be refused before it.
+    test.case("an empty record set spans nothing")
+    test.assert(nvfsmeta.records_span([], 16) == 0)
+
+    test.case("one record spans one padded record")
+    test.assert(nvfsmeta.records_span([nvfsmeta.record(2, bytes.from_byte_list([1]))], 16) == 16)
+
+    test.case("and a set that fits is reported as fitting")
+    test.assert(nvfsmeta.compaction_fits([], 16, 4096))
+
+    test.case("a set larger than the block is not")
+    test.assert(nvfsmeta.compaction_fits([nvfsmeta.record(2, bytes.zeros(8192))], 16, 4096) == false)

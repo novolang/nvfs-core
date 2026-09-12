@@ -1,0 +1,181 @@
+// nvfsgeo_tests.nv — the layout arithmetic, and the padding the whole
+// power-loss story rests on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfsgeo.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE VECTORS ARE `orbit/novofs`'s OWN FORMAT.  Its README carries a
+// section called "On-flash format history" explaining why records are
+// padded out to `max(4, prog_size)` — the first shape of the format
+// packed them against the revision word and was not recoverable — and
+// the assertions below are that paragraph made checkable.  A change
+// that reverted the padding would pass a reading and fail here.
+
+use std.test
+use nvfsgeo
+
+@test
+fn test_records_start_on_their_own_prog_page() [io]
+    // The one fact the seal-revision-last compaction depends on: no
+    // record may share a prog page with the revision word.
+    test.case("a large prog size pushes the records past it")
+    test.assert(nvfsgeo.meta_offset(256) == 256)
+
+    test.case("a small one still leaves room for the four-byte revision")
+    test.assert(nvfsgeo.meta_offset(1) == 4)
+    test.assert(nvfsgeo.meta_offset(4) == 4)
+
+    test.case("and a prog size just past four takes over")
+    test.assert(nvfsgeo.meta_offset(8) == 8)
+
+@test
+fn test_a_record_costs_its_header_its_payload_and_its_crc() [io]
+    test.case("four of header, the payload, four of CRC")
+    test.assert(nvfsgeo.record_size(32) == 40)
+    test.assert(nvfsgeo.record_size(0) == 8)
+
+    test.case("on disk it is padded to a whole number of prog pages")
+    test.assert(nvfsgeo.record_span(32, 16) == 48)
+    test.assert(nvfsgeo.record_span(8, 8) == 8)
+
+    test.case("which is align_up, published so the two cannot disagree")
+    test.assert(nvfsgeo.align_up(9, 4) == 12)
+    test.assert(nvfsgeo.align_up(12, 4) == 12)
+    test.assert(nvfsgeo.align_up(0, 4) == 0)
+
+@test
+fn test_an_append_fits_or_it_does_not() [io]
+    // The four-instruction question a driver asks before every commit.
+    test.case("a record that fits after the log's tail")
+    test.assert(nvfsgeo.append_fits(4096, 256, 512, 32))
+
+    test.case("one that does not, because the block is nearly full")
+    test.assert(nvfsgeo.append_fits(4096, 256, 4000, 32) == false)
+
+    test.case("the padding counts — a record that would fit unpadded may not")
+    test.assert(nvfsgeo.append_fits(512, 256, 256, 32) == false)
+
+@test
+fn test_the_largest_payload_is_bounded_by_the_block() [io]
+    test.case("a payload bound exists and is smaller than the block")
+    test.assert(nvfsgeo.max_payload(4096, 256) < 4096)
+    test.assert(nvfsgeo.max_payload(4096, 256) > 0)
+
+    test.case("a record of exactly that size still fits")
+    test.assert(nvfsgeo.append_fits(4096, 256, nvfsgeo.meta_offset(256),
+                                    nvfsgeo.max_payload(4096, 256)))
+
+@test
+fn test_0xff_is_reserved_forever_because_that_is_what_erased_flash_reads_as() [io]
+    test.case("the erased byte")
+    test.assert(nvfsgeo.erased_byte() == 255)
+
+    test.case("the erased word, which is not a revision")
+    test.assert(nvfsgeo.erased_word() == 4294967295)
+
+    test.case("and the record type nothing may use")
+    test.assert(nvfsgeo.reserved_record_type() == nvfsgeo.erased_byte())
+
+@test
+fn test_the_root_pair_is_anchored_and_never_moves() [io]
+    test.case("blocks 0 and 1")
+    test.assert(nvfsgeo.root_pair_first() == 0)
+    test.assert(nvfsgeo.root_pair_second() == 1)
+
+    test.case("so nothing else may be allocated on them")
+    test.assert(nvfsgeo.block_is_allocatable(0, 32) == false)
+    test.assert(nvfsgeo.block_is_allocatable(1, 32) == false)
+    test.assert(nvfsgeo.block_is_allocatable(2, 32))
+
+    test.case("and a block past the end of the device is not allocatable either")
+    test.assert(nvfsgeo.block_is_allocatable(32, 32) == false)
+
+@test
+fn test_a_geometry_is_refused_with_the_reason_it_was_refused_for() [io]
+    test.case("a usable geometry")
+    match nvfsgeo.check_geometry(16, 16, 512, 32)
+        NvfsOk => test.assert(true)
+        _      => test.assert(false)
+
+    test.case("a device with one block cannot hold the superblock PAIR")
+    match nvfsgeo.check_geometry(16, 16, 512, 1)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("a block that is not a whole number of prog pages")
+    match nvfsgeo.check_geometry(16, 16, 500, 32)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("a block too small for one superblock record")
+    match nvfsgeo.check_geometry(16, 16, 16, 32)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("a zero unit")
+    match nvfsgeo.check_geometry(0, 16, 512, 32)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+@test
+fn test_an_access_is_aligned_and_in_range_or_it_is_refused() [io]
+    // The device contract as a predicate: a violation fails rather
+    // than widening.
+    test.case("an aligned read inside the block")
+    test.assert(nvfsgeo.access_is_valid(4096, 16, 0, 16))
+
+    test.case("a misaligned offset")
+    test.assert(nvfsgeo.access_is_valid(4096, 16, 1, 16) == false)
+
+    test.case("a misaligned length")
+    test.assert(nvfsgeo.access_is_valid(4096, 16, 0, 17) == false)
+
+    test.case("one that runs off the end of the block")
+    test.assert(nvfsgeo.access_is_valid(4096, 16, 4096, 16) == false)
+
+@test
+fn test_a_blank_device_is_not_a_damaged_one() [io]
+    // The distinction a boot sequence turns on: one means format, the
+    // other means do not.
+    test.case("no filesystem is blank")
+    test.assert(nvfsgeo.is_blank(NvfsNoFilesystem))
+
+    test.case("corruption is not")
+    test.assert(nvfsgeo.is_blank(NvfsCorrupt) == false)
+
+    test.case("and neither is a working volume")
+    test.assert(nvfsgeo.is_blank(NvfsOk) == false)
+
+@test
+fn test_the_version_and_the_magic_are_what_a_mount_checks_first() [io]
+    test.case("this library's own version is mountable")
+    test.assert(nvfsgeo.version_is_mountable(nvfsgeo.format_version()))
+
+    test.case("a newer major version is not")
+    test.assert(nvfsgeo.version_is_mountable(nvfsgeo.format_version() + 65536) == false)
+
+    test.case("the magic is four bytes and they are not all the same")
+    test.assert(nvfsgeo.magic_byte(0) != nvfsgeo.magic_byte(1))
+
+    test.case("and none of them is the erased byte, so an erased block cannot look like one")
+    test.assert(nvfsgeo.magic_byte(0) != nvfsgeo.erased_byte())
+    test.assert(nvfsgeo.magic_byte(1) != nvfsgeo.erased_byte())
+    test.assert(nvfsgeo.magic_byte(2) != nvfsgeo.erased_byte())
+    test.assert(nvfsgeo.magic_byte(3) != nvfsgeo.erased_byte())
+
+@test
+fn test_every_error_names_itself() [io]
+    test.case("the names are distinct enough to log")
+    test.assert(nvfsgeo.error_name(NvfsOk) != nvfsgeo.error_name(NvfsNoSpace))
+    test.assert(nvfsgeo.error_name(NvfsNotFound) != nvfsgeo.error_name(NvfsExists))
+    test.assert(nvfsgeo.error_name(NvfsNotDirectory) != nvfsgeo.error_name(NvfsIsDirectory))
+
+    test.case("and none of them is empty")
+    test.assert(nvfsgeo.error_name(NvfsNotSupported) != "")
+    test.assert(nvfsgeo.error_name(NvfsNameTooLong) != "")
+    test.assert(nvfsgeo.error_name(NvfsNotEmpty) != "")
+    test.assert(nvfsgeo.error_name(NvfsIoFailed) != "")
+    test.assert(nvfsgeo.error_name(NvfsGeometryMismatch) != "")
+    test.assert(nvfsgeo.error_name(NvfsVersionUnsupported) != "")
+    test.assert(nvfsgeo.error_name(NvfsInvalidConfig) != "")

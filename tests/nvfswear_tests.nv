@@ -1,0 +1,178 @@
+// nvfswear_tests.nv — arbitration, allocation, and the three
+// power-loss rules as assertions.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfswear.<fn>`.
+//
+// THESE ARE THE RULES A READING CANNOT CHECK.  "The revision word is
+// sealed last" and "a torn block is full" are two sentences in
+// `orbit/novofs`'s README, and a rewrite that broke either would still
+// pass every functional test — the volume works until the power goes
+// out at the wrong microsecond.  Written as predicates, they are
+// checkable in a millisecond and on every commit.
+
+use std.test
+use nvfswear
+
+@test
+fn test_the_higher_sealed_revision_wins() [io]
+    test.case("the second block, when its revision is higher")
+    test.assert(nvfswear.winner(3, true, 4, true) == 1)
+
+    test.case("the first, when its revision is higher")
+    test.assert(nvfswear.winner(5, true, 4, true) == 0)
+
+    test.case("a tie goes to the first, which is what makes a fresh format complete")
+    test.assert(nvfswear.winner(1, true, 1, true) == 0)
+
+    test.case("an unsealed block does not take part, whatever its word says")
+    test.assert(nvfswear.winner(9, false, 1, true) == 1)
+    test.assert(nvfswear.winner(1, true, 9, false) == 0)
+
+    test.case("and neither sealed is neither")
+    test.assert(nvfswear.winner(0, false, 0, false) == 0 - 1)
+
+@test
+fn test_an_erased_revision_word_is_not_a_revision() [io]
+    // Rule 1 read backwards: a compaction interrupted before its seal
+    // leaves exactly this, and the old block keeps winning.
+    test.case("the erased word is not sealed")
+    test.assert(nvfswear.revision_is_sealed(4294967295) == false)
+
+    test.case("a programmed one is")
+    test.assert(nvfswear.revision_is_sealed(1))
+
+    test.case("including zero, which is a revision like any other")
+    test.assert(nvfswear.revision_is_sealed(0))
+
+    test.case("and a compaction carries the next one")
+    test.assert(nvfswear.next_revision(7) == 8)
+
+@test
+fn test_the_seal_is_its_own_prog_page_at_offset_zero() [io]
+    test.case("the revision word is at the start of the block")
+    test.assert(nvfswear.seal_offset() == 0)
+
+    test.case("and the program that writes it covers a whole prog page")
+    test.assert(nvfswear.seal_span(256) == 256)
+    test.assert(nvfswear.seal_span(4) == 4)
+
+@test
+fn test_a_torn_block_is_full_whatever_space_it_appears_to_have() [io]
+    // Rule 2.  NOR programming only clears bits, so a garbage tail
+    // cannot be rewritten and the next commit must compact.
+    test.case("a clean block with room takes the append")
+    test.assert(nvfswear.append_allowed(false, 512, 48, 4096))
+
+    test.case("a torn one refuses it, even with the same room")
+    test.assert(nvfswear.append_allowed(true, 512, 48, 4096) == false)
+
+    test.case("and a clean block with no room refuses it too")
+    test.assert(nvfswear.append_allowed(false, 4080, 48, 4096) == false)
+
+    test.case("a record that exactly fills the block is allowed")
+    test.assert(nvfswear.append_allowed(false, 4048, 48, 4096))
+
+@test
+fn test_allocation_is_a_bounded_scan_that_answers_no_space_rather_than_looping() [io]
+    test.case("a fresh scan looks at its cursor")
+    let a = nvfswear.alloc(2)
+    test.assert(nvfswear.alloc_candidate(a, 256) == 2)
+    test.assert(nvfswear.alloc_taken(a) == 0)
+    test.assert(nvfswear.alloc_exhausted(a, 256) == false)
+
+    test.case("a cursor past the end wraps into range")
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(300), 256) >= 2)
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(300), 256) < 256)
+
+    test.case("a cursor below the first allocatable block is lifted to it")
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(0), 256) == 2)
+
+    test.case("taking a block counts it and moves on")
+    let taken = nvfswear.alloc_take(a, 256)
+    test.assert(nvfswear.alloc_taken(taken) == 1)
+    test.assert(nvfswear.alloc_candidate(taken, 256) == 3)
+
+    test.case("skipping moves on without counting")
+    let skipped = nvfswear.alloc_skip(a, 256)
+    test.assert(nvfswear.alloc_taken(skipped) == 0)
+    test.assert(nvfswear.alloc_candidate(skipped, 256) == 3)
+
+    test.case("and the cursor to remember is where the scan got to")
+    test.assert(nvfswear.alloc_cursor(taken) == 3)
+
+@test
+fn test_the_first_two_blocks_are_the_root_and_are_never_allocated() [io]
+    test.case("allocation starts at block 2")
+    test.assert(nvfswear.first_allocatable() == 2)
+
+    test.case("and the cursor seed never lands below it")
+    test.assert(nvfswear.cursor_seed(0, 256) >= 2)
+    test.assert(nvfswear.cursor_seed(7, 256) >= 2)
+    test.assert(nvfswear.cursor_seed(999999, 256) >= 2)
+
+    test.case("nor above the device")
+    test.assert(nvfswear.cursor_seed(999999, 256) < 256)
+
+    test.case("and two different revisions do not both start in the same place")
+    test.assert(nvfswear.cursor_seed(1, 256) != nvfswear.cursor_seed(2, 256))
+
+@test
+fn test_relocation_is_a_modulo_over_the_revision() [io]
+    // Every compaction bumps the revision, so the revision IS the pair's
+    // erase count.
+    test.case("a pair that has compacted exactly the threshold moves")
+    test.assert(nvfswear.should_relocate(100, 100))
+
+    test.case("one that has not, does not")
+    test.assert(nvfswear.should_relocate(99, 100) == false)
+
+    test.case("and it moves again at twice the threshold")
+    test.assert(nvfswear.should_relocate(200, 100))
+
+    test.case("a disabled threshold never moves anything")
+    test.assert(nvfswear.relocation_disabled(0 - 1))
+    test.assert(nvfswear.should_relocate(100, 0 - 1) == false)
+
+    test.case("a revision of zero is not a relocation, whatever the modulo says")
+    test.assert(nvfswear.should_relocate(0, 100) == false)
+
+@test
+fn test_minus_one_stores_as_zero_because_the_field_is_a_u32() [io]
+    test.case("the encoding")
+    test.assert(nvfswear.encode_block_cycles(0 - 1) == 0)
+    test.assert(nvfswear.encode_block_cycles(100) == 100)
+
+    test.case("and the decoding round-trips it")
+    test.assert(nvfswear.decode_block_cycles(0) == 0 - 1)
+    test.assert(nvfswear.decode_block_cycles(100) == 100)
+    test.assert(nvfswear.decode_block_cycles(nvfswear.encode_block_cycles(0 - 1)) == 0 - 1)
+
+    test.case("zero is refused as a SETTING — it would relocate on every commit")
+    test.assert(nvfswear.block_cycles_valid(0) == false)
+    test.assert(nvfswear.block_cycles_valid(100))
+    test.assert(nvfswear.block_cycles_valid(0 - 1))
+
+    test.case("and nothing below -1 is a setting either")
+    test.assert(nvfswear.block_cycles_valid(0 - 2) == false)
+
+@test
+fn test_a_failed_operation_retires_its_block_and_the_allocation_retries() [io]
+    test.case("a failure retires")
+    test.assert(nvfswear.should_retire(false))
+
+    test.case("a success does not")
+    test.assert(nvfswear.should_retire(true) == false)
+
+    test.case("and the retry budget is published so a driver's own agrees with it")
+    test.assert(nvfswear.allocation_attempts() == 3)
+
+@test
+fn test_the_revision_wrap_is_a_deferral_a_caller_can_detect() [io]
+    // A documented deferral nobody can detect is one nobody will
+    // notice, and this format's revision is a u32.
+    test.case("an ordinary revision is nowhere near it")
+    test.assert(nvfswear.revision_near_wrap(7) == false)
+
+    test.case("one close to the erased word is")
+    test.assert(nvfswear.revision_near_wrap(4294967294))

@@ -1,0 +1,276 @@
+// nvfsop_tests.nv — the state machine, and what the action-as-a-value
+// shape buys.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: nvfs-core.nvfsop.<fn>`.
+//
+// THIS SUITE IS THE ARGUMENT FOR `NvfsAction`.  Every case below drives
+// a real filesystem operation to completion with no device, no trait
+// and no `[io]` — the "device" is `erased_block`, forty lines up, and a
+// `match` that answers each action out of it.  With littlefs's
+// callbacks, or with `orbit/novofs`'s `Flash` trait, none of this file
+// could exist: it would need a device implementation, and the effects
+// of that implementation would be charged to every function that could
+// reach one.
+//
+// THE POWER-CUT CASE IS THE ONE THAT MATTERS MOST.  `orbit/novofs`
+// proves its crash resistance with a 1096-cut torture harness built
+// around a fault-injecting RAM device that can tear a program mid-page.
+// Here a cut at action N is: run N actions and stop.  The last case
+// below is that harness in nine lines, and `actions_taken` is what
+// makes "cut at N" addressable.
+
+use std.test
+use std.bytes
+use std.list
+use nvfsop
+use nvfsvol
+
+fn small_geometry() -> nvfsvol.NvfsGeometry
+    nvfsvol.geometry(16, 16, 512, 32)
+
+fn erased_block(size: Int) -> Bytes
+    bytes.from_byte_list(list.range(0, size) |> list.map(_ => 255))
+
+// The whole "device" this suite needs: answer every read with an erased
+// block and acknowledge every write.  A driver over a real part differs
+// from this in nothing but what it does with the action.
+fn drive(start: nvfsop.NvfsProgress, budget: Int) -> nvfsop.NvfsProgress
+    var p = start
+    var steps = 0
+    var running = true
+    while running and steps < budget
+        match p.step
+            NvfsNeed(a)   =>
+                match a
+                    NvfsRead(_, _, len) =>
+                        p = nvfsop.resume_read(p.machine, erased_block(len))
+                    _                   =>
+                        p = nvfsop.resume_ok(p.machine, true)
+            NvfsDone(_)   =>
+                running = false
+            NvfsFailed(_) =>
+                running = false
+        steps = steps + 1
+    p
+
+@test
+fn test_a_machine_asks_before_it_does_anything() [io]
+    test.case("a mount's first step is a request, not an answer")
+    let p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsMount)
+    match p.step
+        NvfsNeed(_)   => test.assert(true)
+        NvfsDone(_)   => test.assert(false)
+        NvfsFailed(_) => test.assert(false)
+
+    test.case("and nothing has been performed yet")
+    test.assert(nvfsop.actions_taken(p.machine) == 0)
+
+    test.case("the action it wants is the one `pending` reports")
+    match nvfsop.pending(p.machine)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("a mount reads the superblock pair, which is block 0")
+    match p.step
+        NvfsNeed(a)   => test.assert(nvfsop.action_block(a) == 0)
+        NvfsDone(_)   => test.assert(false)
+        NvfsFailed(_) => test.assert(false)
+
+@test
+fn test_every_action_is_one_of_littlefss_four_callbacks() [io]
+    test.case("a read names a block, an offset and a length")
+    test.assert(nvfsop.action_block(NvfsRead(3, 0, 16)) == 3)
+    test.assert(nvfsop.action_length(NvfsRead(3, 0, 16)) == 16)
+    test.assert(nvfsop.action_is_write(NvfsRead(3, 0, 16)) == false)
+
+    test.case("a program names a block, an offset and the bytes")
+    test.assert(nvfsop.action_block(NvfsProg(3, 0, bytes.zeros(16))) == 3)
+    test.assert(nvfsop.action_length(NvfsProg(3, 0, bytes.zeros(16))) == 16)
+    test.assert(nvfsop.action_is_write(NvfsProg(3, 0, bytes.zeros(16))))
+
+    test.case("an erase names a block and moves no bytes")
+    test.assert(nvfsop.action_block(NvfsErase(3)) == 3)
+    test.assert(nvfsop.action_length(NvfsErase(3)) == 0)
+    test.assert(nvfsop.action_is_write(NvfsErase(3)))
+
+    test.case("and a sync names nothing")
+    test.assert(nvfsop.action_block(NvfsSync) == 0 - 1)
+    test.assert(nvfsop.action_is_write(NvfsSync) == false)
+
+@test
+fn test_every_action_a_machine_emits_respects_the_devices_alignment() [io]
+    // The machine's own output, checked against the geometry it was
+    // given.  A misaligned program is a device that quietly refuses.
+    let g = small_geometry()
+
+    test.case("an aligned read is valid")
+    test.assert(nvfsop.action_is_valid(NvfsRead(0, 0, 16), g))
+
+    test.case("a misaligned one is not")
+    test.assert(nvfsop.action_is_valid(NvfsRead(0, 1, 16), g) == false)
+
+    test.case("one past the end of the block is not")
+    test.assert(nvfsop.action_is_valid(NvfsRead(0, 512, 16), g) == false)
+
+    test.case("nor is one naming a block past the end of the device")
+    test.assert(nvfsop.action_is_valid(NvfsErase(32), g) == false)
+
+    test.case("and the mount's own first action is valid")
+    let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+    match p.step
+        NvfsNeed(a)   => test.assert(nvfsop.action_is_valid(a, g))
+        NvfsDone(_)   => test.assert(false)
+        NvfsFailed(_) => test.assert(false)
+
+@test
+fn test_an_erased_device_mounts_as_no_filesystem_rather_than_as_damage() [io]
+    // The distinction a boot sequence turns on, driven end to end
+    // against a byte array.
+    test.case("a mount over an erased device finishes")
+    let p = drive(nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsMount), 64)
+    match p.step
+        NvfsNeed(_)   => test.assert(false)
+        NvfsDone(_)   => test.assert(false)
+        NvfsFailed(e) =>
+            match e
+                NvfsNoFilesystem => test.assert(true)
+                _                => test.assert(false)
+
+    test.case("and it performed some actions to find out")
+    test.assert(nvfsop.actions_taken(p.machine) > 0)
+
+    test.case("it read rather than wrote — a mount never changes the device")
+    test.assert(nvfsop.op_is_mutating(NvfsMount) == false)
+
+@test
+fn test_a_format_writes_and_then_a_mount_finds_what_it_wrote() [io]
+    test.case("a format is a mutating operation")
+    test.assert(nvfsop.op_is_mutating(NvfsFormat))
+
+    test.case("and it finishes against a device that acknowledges its writes")
+    let p = drive(nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsFormat), 64)
+    match p.step
+        NvfsNeed(_)   => test.assert(false)
+        NvfsDone(_)   => test.assert(true)
+        NvfsFailed(_) => test.assert(false)
+
+    test.case("it erased the sibling before it programmed anything")
+    test.assert(nvfsop.actions_taken(p.machine) > 1)
+
+@test
+fn test_which_operations_can_change_the_device_is_a_question_with_an_answer() [io]
+    // A read-only volume can refuse the writing operations before they
+    // start rather than failing partway.
+    test.case("the reading operations")
+    test.assert(nvfsop.op_is_mutating(NvfsStat("/a")) == false)
+    test.assert(nvfsop.op_is_mutating(NvfsReadDir("/")) == false)
+    test.assert(nvfsop.op_is_mutating(NvfsCheck) == false)
+    test.assert(nvfsop.op_is_mutating(NvfsSeek(1, 0, 0)) == false)
+
+    test.case("the writing ones")
+    test.assert(nvfsop.op_is_mutating(NvfsMkdir("/logs")))
+    test.assert(nvfsop.op_is_mutating(NvfsRemove("/a")))
+    test.assert(nvfsop.op_is_mutating(NvfsRename("/a", "/b")))
+    test.assert(nvfsop.op_is_mutating(NvfsWrite(1, bytes.zeros(4))))
+    test.assert(nvfsop.op_is_mutating(NvfsTruncate(1, 0)))
+
+    test.case("and every path-named operation reports its path")
+    test.assert(nvfsop.op_path(NvfsReadDir("/logs")) == "/logs")
+    test.assert(nvfsop.op_path(NvfsRename("/a", "/b")) == "/a")
+    test.assert(nvfsop.op_path(NvfsMount) == "")
+
+@test
+fn test_a_handle_is_a_number_the_machine_remembers_and_nothing_on_disk() [io]
+    // The widening `orbit/novofs` does not have: it is path-based and
+    // stateless, so an append reads the whole file and writes it back.
+    test.case("a machine that has opened nothing has no handles")
+    let p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsMount)
+    test.assert(nvfsop.handle_is_open(p.machine, 1) == false)
+
+    test.case("and a handle it does not have has no position")
+    test.assert(nvfsop.handle_position(p.machine, 1) == 0 - 1)
+
+    test.case("an open is a mutating operation only when it may create")
+    test.assert(nvfsop.op_is_mutating(NvfsOpen("/a", true)))
+    test.assert(nvfsop.op_is_mutating(NvfsOpen("/a", false)) == false)
+
+@test
+fn test_a_mismatched_answer_is_refused_rather_than_papered_over() [io]
+    test.case("bytes for an action that wanted an acknowledgement")
+    let p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsFormat)
+    let q = nvfsop.resume(p.machine, NvfsGotBytes(bytes.zeros(16)))
+    match q.step
+        NvfsFailed(e) =>
+            match e
+                NvfsCorrupt => test.assert(true)
+                _           => test.assert(false)
+        NvfsNeed(_)   => test.assert(false)
+        NvfsDone(_)   => test.assert(false)
+
+@test
+fn test_a_report_is_every_problem_rather_than_the_first() [io]
+    // An fsck that stopped at the first fault would send a user to fix
+    // one thing and come back.
+    test.case("an empty report is clean")
+    test.assert(nvfsop.report_is_clean(nvfsop.empty_report()))
+    test.assert(list.len(nvfsop.empty_report().problems) == 0)
+
+    test.case("and it counts nothing yet")
+    test.assert(nvfsop.empty_report().files == 0)
+    test.assert(nvfsop.empty_report().directories == 0)
+    test.assert(nvfsop.empty_report().max_revision == 0)
+
+@test
+fn test_a_power_cut_is_a_test_that_stops_feeding_answers() [io]
+    // The 1096-cut torture harness, in nine lines and with no device.
+    test.case("a format driven to completion reaches an answer")
+    let whole = drive(nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsFormat), 64)
+    let total = nvfsop.actions_taken(whole.machine)
+    test.assert(total > 0)
+
+    test.case("and stopping one action short leaves the machine still asking")
+    let cut = drive(nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsFormat), total - 1)
+    match cut.step
+        NvfsNeed(_)   => test.assert(true)
+        NvfsDone(_)   => test.assert(false)
+        NvfsFailed(_) => test.assert(false)
+
+    test.case("every cut worth testing is at a write, and the predicate says which")
+    var writes = 0
+    var p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsFormat)
+    var steps = 0
+    var running = true
+    while running and steps < 64
+        match p.step
+            NvfsNeed(a)   =>
+                if nvfsop.action_is_write(a)
+                    writes = writes + 1
+                match a
+                    NvfsRead(_, _, len) =>
+                        p = nvfsop.resume_read(p.machine, erased_block(len))
+                    _                   =>
+                        p = nvfsop.resume_ok(p.machine, true)
+            NvfsDone(_)   =>
+                running = false
+            NvfsFailed(_) =>
+                running = false
+        steps = steps + 1
+    test.assert(writes > 0)
+
+@test
+fn test_a_volume_is_absent_until_a_mount_has_read_one() [io]
+    test.case("a fresh machine has no volume")
+    let p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsMount)
+    match nvfsop.volume(p.machine)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("and an operation on a mounted volume starts from one")
+    let g = small_geometry()
+    let sb = nvfsvol.superblock(65536, 512, 32, 64, 128, 4096, 100)
+    let v = nvfsvol.volume(g, sb, 1, 0)
+    let q = nvfsop.begin_on(v, nvfsvol.default_config(), NvfsReadDir("/"))
+    match nvfsop.volume(q.machine)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)

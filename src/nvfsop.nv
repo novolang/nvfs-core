@@ -1,0 +1,495 @@
+// nvfsop.nv — every filesystem operation as a state machine that
+// answers the block reads and writes a host must perform.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOAD-BEARING INTERFACE IS `NvfsAction`, AND THE ARGUMENT FOR IT
+// IS AN INVERSION.  littlefs takes four function pointers — `read`,
+// `prog`, `erase`, `sync` — in an `lfs_config` and calls them from
+// inside itself.  `orbit/novofs` is the same shape in novo-lang: a
+// `Flash` trait whose every method is `[io, hw, mutate]`, called from
+// inside the filesystem.  That inversion is why novofs is an `app` and
+// not a library: the arithmetic that decides where a record goes cannot
+// be reached without a device behind it, and the effects of the
+// callback are charged to every function that might reach one.
+//
+// Turning the four callbacks into a VALUE moves the call to the host:
+//
+//     var p = nvfsop.begin(geometry, config, NvfsMount)
+//     while true
+//         match p.step
+//             NvfsNeed(a)   => p = nvfsop.resume(p.machine, perform(a))
+//             NvfsDone(ans) => break
+//             NvfsFailed(e) => break
+//
+// and three things follow that could not before.
+//
+//   1. THE WHOLE FORMAT IS EXERCISABLE AGAINST A BYTE ARRAY.  There is
+//      no device to stand up, no trait to implement, no `[io]` anywhere
+//      — a test answers `NvfsRead` out of a `Bytes` it built by hand.
+//   2. A POWER CUT IS A TEST THAT STOPS FEEDING ANSWERS.  `orbit/novofs`
+//      proves its crash resistance with a 1096-cut torture harness
+//      built around a fault-injecting RAM device that can tear a
+//      program mid-page.  Here, a cut at action N is: run N actions,
+//      stop, and mount what the array holds.  Every one of those 1096
+//      cuts is reachable with no device at all, and `actions_taken` is
+//      what makes "cut at N" addressable.
+//   3. ONE MACHINE SERVES EVERY DEVICE.  A QEMU flash, a file-backed
+//      image and a real NOR part differ in who performs the action and
+//      in nothing else, so there is no trait parameter and no generic
+//      to instantiate per device.
+//
+// WHAT THIS MODULE IS NOT: it is not in the device claim.  An action
+// carries `Bytes`, an answer carries a list of entries, and the machine
+// holds a path.  A firmware that wants a filesystem wants a heap; a
+// firmware that wants to seek a chain or decide whether a commit fits
+// wants `nvfsctz` and `nvfsgeo`, and those link with neither.
+//
+// HANDLES ARE HERE AND ARE NOT IN `orbit/novofs`.  novofs is
+// path-based and stateless — every operation walks from the root — so
+// an append is O(n): it reads the whole file and writes it back.  Its
+// own README names the fix ("an O(1) tail append needs file handles").
+// `NvfsOpen` and `NvfsHandle` are that fix, and they are a WIDENING of
+// what the split was asked for: the state machine has a place to keep a
+// cursor, which the stateless API had nowhere to put.  The cost is
+// stated rather than hidden — a handle is a number the machine
+// remembers, so a host that drops a machine drops its handles, and
+// there is nothing on disk to make stale.
+
+use nvfsgeo
+use nvfsmeta
+use nvfsvol
+
+// What the host must do next.
+//
+// littlefs's four `lfs_config` callbacks, turned into values.  The
+// signatures are the callbacks' own: a read names a block, an offset
+// and a length; a program names a block, an offset and the bytes; an
+// erase names a block; a sync names nothing.
+pub enum NvfsAction
+    // Read `len` bytes at `off` in `block` and hand them back with
+    // `resume_read`.
+    NvfsRead(block: Int, off: Int, len: Int)
+    // Program these bytes at `off` in `block`.  NOR semantics: this
+    // may only CLEAR bits, so the region must have been erased, and
+    // the machine never programs a byte twice without an erase between
+    // — which is the property a strict device is worth testing against.
+    NvfsProg(block: Int, off: Int, data: Bytes)
+    // Erase `block` to all `0xFF`.
+    NvfsErase(block: Int)
+    // Flush whatever the device buffered.  The machine asks for one
+    // after the last program of a commit and before it reports the
+    // commit done, which is what makes "the answer arrived" mean "the
+    // bytes are on the part".
+    NvfsSync
+
+// What the host reports back.
+//
+// A read answers bytes; the other three answer whether they worked.
+// Separate from `NvfsAction` because a machine that took the action
+// back would have to trust the caller to return the right one.
+pub enum NvfsAnswer
+    NvfsGotBytes(data: Bytes)
+    NvfsGotOk(succeeded: Bool)
+
+// What a caller asked for.
+//
+// littlefs's operation set, with `NvfsCheck` for fsck.  A path-based
+// operation names its path; a handle-based one names its handle.
+pub enum NvfsOp
+    // Write a fresh filesystem over the device.
+    NvfsFormat
+    // Read the superblock and check it against the device.
+    NvfsMount
+    // One entry's metadata.
+    NvfsStat(path: Str)
+    // A directory's entries.
+    NvfsReadDir(path: Str)
+    // A new directory.  The parent must exist and the leaf must not.
+    NvfsMkdir(path: Str)
+    // A file, or an EMPTY directory.  There is no recursive remove,
+    // because one tombstone is one atomic commit and a recursive
+    // delete could not be.
+    NvfsRemove(path: Str)
+    // A rename within one directory.  Across directories it is
+    // `NvfsNotSupported`: that would be two pairs committed together,
+    // which this format cannot express without littlefs's global move
+    // state.
+    NvfsRename(from_path: Str, to_path: Str)
+    // Open a file and answer a handle.  `create` says whether a
+    // missing file is made or is `NvfsNotFound`.
+    NvfsOpen(path: Str, create: Bool)
+    // Read from a handle at its cursor.
+    NvfsReadFile(handle: Int, len: Int)
+    // Write to a handle at its cursor.
+    NvfsWrite(handle: Int, data: Bytes)
+    // Move a handle's cursor.  `whence` is 0 from the start, 1 from
+    // the cursor, 2 from the end.
+    NvfsSeek(handle: Int, off: Int, whence: Int)
+    // Shorten or extend a handle's file.
+    NvfsTruncate(handle: Int, new_size: Int)
+    // Commit a handle's outstanding writes and forget it.
+    NvfsClose(handle: Int)
+    // Walk the whole volume and report what it found.
+    NvfsCheck
+
+// What an operation answered.
+pub enum NvfsResult
+    // `NvfsMount` and `NvfsFormat`.
+    NvfsMounted(volume: nvfsvol.NvfsVolume)
+    // `NvfsReadDir`.
+    NvfsEntries(entries: [nvfsvol.NvfsEntry])
+    // `NvfsStat`.
+    NvfsStatted(entry: nvfsvol.NvfsEntry)
+    // `NvfsReadFile`.  Shorter than asked for at the end of the file.
+    NvfsData(data: Bytes)
+    // `NvfsOpen`.
+    NvfsHandle(handle: Int)
+    // `NvfsWrite`.
+    NvfsWritten(count: Int)
+    // `NvfsSeek`.
+    NvfsPosition(off: Int)
+    // `NvfsCheck`.
+    NvfsChecked(report: NvfsReport)
+    // Everything that answers only "it worked": mkdir, remove, rename,
+    // truncate, close.
+    NvfsCompleted
+
+// What a walk of the whole volume found.
+//
+// `problems` is a list rather than a first failure, because an fsck
+// that stopped at the first fault would send a user to fix one thing
+// and come back, and because the second fault is often what explains
+// the first.
+pub struct NvfsReport
+    blocks_used: Int
+    blocks_free: Int
+    files: Int
+    directories: Int
+    // The highest metadata-pair revision seen, which is the closest
+    // this format has to a wear reading.
+    max_revision: Int
+    problems: [Str]
+
+// One step of an operation.
+pub enum NvfsStep
+    // Perform this and come back with `resume_read` or `resume_ok`.
+    NvfsNeed(action: NvfsAction)
+    // The operation finished.
+    NvfsDone(result: NvfsResult)
+    // The operation failed, and this is why.
+    NvfsFailed(error: nvfsgeo.NvfsError)
+
+// A machine and the step it just took.
+//
+// Both, so a driver's loop is one `match` with no second call to ask
+// what happened.
+pub struct NvfsProgress
+    machine: NvfsMachine
+    step: NvfsStep
+
+// An operation in progress.
+//
+// The fields are flat integers rather than the `@value` structs
+// `nvfsctz` and `nvfswear` publish, and that is a constraint rather
+// than a preference: a `@value` struct may not be a boxed struct's
+// field (SPEC § 14.3), so a machine that held an `NvfsCtzWalk` would
+// be refused.  It holds the walk's three numbers and rebuilds the walk
+// per step, which costs nothing and keeps both halves of the package
+// honest about which one has the heap.
+pub struct NvfsMachine
+    geometry: nvfsvol.NvfsGeometry
+    config: nvfsvol.NvfsConfig
+    op: NvfsOp
+    // Where the operation is in its own sequence.  Opaque to a caller
+    // and readable so a test can assert that a mount reached the
+    // superblock before it asked for block 1.
+    phase: Int
+    // The metadata pair the operation is working in.
+    pair: nvfsmeta.NvfsPair
+    // The allocation cursor, carried across the operation so two
+    // allocations in one commit do not both pick the same block.
+    cursor: Int
+    // The chain walk, as its three numbers.
+    walk_block: Int
+    walk_index: Int
+    walk_target: Int
+    // How many actions the host has performed, which is what makes
+    // "cut the power at action N" an addressable test.
+    actions_taken: Int
+    // The volume, once a mount has read one.
+    volume: ?nvfsvol.NvfsVolume
+
+// Start an operation on a device that has not been mounted.
+//
+// Only `NvfsFormat` and `NvfsMount` begin here; everything else needs
+// the volume a mount answered, and `begin_on` is that call.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     println("${nvfsop.actions_taken(p.machine)}")
+// ```
+pub fn begin(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
+    todo("nvfs-core.nvfsop.begin")
+
+// Start an operation on a mounted volume.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     println("${nvfsop.actions_taken(p.machine)}")
+// ```
+pub fn begin_on(v: nvfsvol.NvfsVolume, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
+    todo("nvfs-core.nvfsop.begin_on")
+
+// Hand back the bytes a `NvfsRead` asked for, and take the next step.
+//
+// ```novo
+// use std.bytes
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     let q = nvfsop.resume_read(p.machine, bytes.zeros(512))
+//     println("${nvfsop.actions_taken(q.machine)}")
+// ```
+pub fn resume_read(m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    todo("nvfs-core.nvfsop.resume_read")
+
+// Report whether a program, erase or sync worked, and take the next
+// step.
+//
+// A `false` is not always a failure: a failed erase retires the block
+// and the machine retries the allocation elsewhere, up to
+// `nvfswear.allocation_attempts` times, which is how a worn part keeps
+// working rather than becoming read-only at the first bad block.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsFormat)
+//     println("${nvfsop.actions_taken(nvfsop.resume_ok(p.machine, true).machine)}")
+// ```
+pub fn resume_ok(m: NvfsMachine, succeeded: Bool) -> NvfsProgress []
+    todo("nvfs-core.nvfsop.resume_ok")
+
+// Hand back whichever answer the action wanted.
+//
+// The one-call form, for a driver that performs actions through one
+// function and would rather not branch twice.  A `NvfsGotBytes` for an
+// action that wanted an acknowledgement is `NvfsCorrupt`, because a
+// driver that mismatched them has a bug the machine cannot paper over.
+//
+// ```novo
+// use std.bytes
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     let q = nvfsop.resume(p.machine, NvfsGotBytes(bytes.zeros(512)))
+//     println("${nvfsop.actions_taken(q.machine)}")
+// ```
+pub fn resume(m: NvfsMachine, answer: NvfsAnswer) -> NvfsProgress []
+    todo("nvfs-core.nvfsop.resume")
+
+// The action a machine is waiting on, or `None` when it is not waiting.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     match nvfsop.pending(p.machine)
+//         None    => println("not waiting")
+//         Some(_) => println("waiting")
+// ```
+pub fn pending(m: NvfsMachine) -> ?NvfsAction []
+    todo("nvfs-core.nvfsop.pending")
+
+// How many actions the host has performed for this machine.
+//
+// What makes "cut the power at action N" addressable, and the number a
+// torture harness enumerates.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println("${nvfsop.actions_taken(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine)}")
+// ```
+pub fn actions_taken(m: NvfsMachine) -> Int []
+    todo("nvfs-core.nvfsop.actions_taken")
+
+// Whether an action changes the device.
+//
+// The predicate a power-cut harness enumerates over — only a program
+// or an erase can leave the volume in a state a mount has to survive,
+// so the cuts worth testing are exactly these.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println("${nvfsop.action_is_write(NvfsErase(3))}")
+// ```
+pub fn action_is_write(a: NvfsAction) -> Bool []
+    todo("nvfs-core.nvfsop.action_is_write")
+
+// Which block an action touches, and -1 for a sync.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println("${nvfsop.action_block(NvfsErase(3))}")
+// ```
+pub fn action_block(a: NvfsAction) -> Int []
+    todo("nvfs-core.nvfsop.action_block")
+
+// How many bytes an action moves, and 0 for an erase or a sync.
+//
+// Published because a driver sizing its own buffer needs it before it
+// performs the action, and because a test asserting that a mount reads
+// one block and not the whole device asserts on this.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println("${nvfsop.action_length(NvfsRead(0, 0, 512))}")
+// ```
+pub fn action_length(a: NvfsAction) -> Int []
+    todo("nvfs-core.nvfsop.action_length")
+
+// Whether an action respects the device's alignment and bounds.
+//
+// The machine's own output, checked against the geometry it was given.
+// Published so a driver can assert it in a debug build rather than
+// discovering a misaligned program as a device that quietly refuses.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println("${nvfsop.action_is_valid(NvfsRead(0, 0, 512), g)}")
+// ```
+pub fn action_is_valid(a: NvfsAction, g: nvfsvol.NvfsGeometry) -> Bool []
+    todo("nvfs-core.nvfsop.action_is_valid")
+
+// The volume a machine is working on, or `None` before a mount.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     match nvfsop.volume(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine)
+//         None    => println("not mounted")
+//         Some(_) => println("mounted")
+// ```
+pub fn volume(m: NvfsMachine) -> ?nvfsvol.NvfsVolume []
+    todo("nvfs-core.nvfsop.volume")
+
+// A handle's current cursor.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println("${nvfsop.handle_position(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine, 1)}")
+// ```
+pub fn handle_position(m: NvfsMachine, handle: Int) -> Int []
+    todo("nvfs-core.nvfsop.handle_position")
+
+// Whether a handle is one this machine opened and has not closed.
+//
+// A handle is a number the machine remembers and nothing on disk, so a
+// host that drops a machine drops its handles and there is nothing to
+// make stale.  A caller holding a number from a machine that is gone
+// is told so rather than reading somebody else's file.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println("${nvfsop.handle_is_open(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine, 1)}")
+// ```
+pub fn handle_is_open(m: NvfsMachine, handle: Int) -> Bool []
+    todo("nvfs-core.nvfsop.handle_is_open")
+
+// Whether an operation, run to completion, can change the device.
+//
+// A read-only volume — an image mounted to be listed — can refuse the
+// writing operations before they start rather than failing partway,
+// and a caller can tell the two kinds apart without a table of its own.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println("${nvfsop.op_is_mutating(NvfsReadDir("/"))}")
+// ```
+pub fn op_is_mutating(op: NvfsOp) -> Bool []
+    todo("nvfs-core.nvfsop.op_is_mutating")
+
+// The path an operation names, and the empty string for one that names
+// none.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println(nvfsop.op_path(NvfsReadDir("/logs")))
+// ```
+pub fn op_path(op: NvfsOp) -> Str []
+    todo("nvfs-core.nvfsop.op_path")
+
+// An empty report, for a caller building one itself.
+//
+// ```novo
+// use std.list
+// use nvfsop
+//
+// fn main() [io]
+//     println("${list.len(nvfsop.empty_report().problems)}")
+// ```
+pub fn empty_report() -> NvfsReport []
+    todo("nvfs-core.nvfsop.empty_report")
+
+// Whether a report found nothing wrong.
+//
+// ```novo
+// use nvfsop
+//
+// fn main() [io]
+//     println("${nvfsop.report_is_clean(nvfsop.empty_report())}")
+// ```
+pub fn report_is_clean(r: NvfsReport) -> Bool []
+    todo("nvfs-core.nvfsop.report_is_clean")

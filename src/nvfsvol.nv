@@ -1,0 +1,535 @@
+// nvfsvol.nv — what a record MEANS: the superblock, the directory
+// entries, and the fold that turns a log into a directory.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOT IN THE DEVICE CLAIM.  An entry holds a name and, for a small
+// file, its contents; a fold answers a list of them.  Both allocate.
+//
+// FIVE RECORD TYPES, AND 0xFF IS RESERVED FOREVER:
+//
+//     0x01 superblock   magic, version, geometry, the bounds
+//     0x02 entry        kind, name, and two kind-dependent words
+//     0x03 tombstone    a name that is gone
+//     0x04 rename       an old name and a new one, in ONE record
+//     0xFF reserved     what erased flash reads as
+//
+// THE RENAME IS ONE RECORD AND THAT IS THE WHOLE ARGUMENT FOR IT.  A
+// rename written as a tombstone plus an entry is two commits, and a
+// power cut between them loses the file — the name it had is gone and
+// the name it was getting never arrived.  One record makes it atomic
+// for free, and it is why a cross-directory move is `NvfsNotSupported`
+// rather than done unsafely: that one would be two records in two
+// different pairs, which this format cannot commit together.
+//
+// A DIRECTORY'S LIVE STATE IS A FOLD OVER ITS LOG, in order: an entry
+// record upserts by name, a tombstone removes, a rename moves.  So
+// reading a directory is reading one block and folding, and there is no
+// index to keep consistent across a power cut.
+//
+// THE ROOT IS THE SUPERBLOCK PAIR.  Blocks 0 and 1 hold both, exactly
+// as littlefs does, which is why the root never relocates and why a
+// compaction of the root has to preserve a superblock record that no
+// other directory has.
+
+use nvfsgeo
+use nvfsmeta
+
+// The device this volume is formatted for.
+//
+// A plain struct rather than a `@value` one: it is a host-side
+// description that travels inside `NvfsVolume`, and a `@value` type
+// cannot be a boxed struct's field.  The device half of this package
+// takes these four as separate `Int`s for exactly that reason, which
+// is `nvfsgeo`'s whole signature style.
+pub struct NvfsGeometry
+    read_size: Int
+    prog_size: Int
+    block_size: Int
+    block_count: Int
+
+// The choices a format makes, which the superblock then carries.
+pub struct NvfsConfig
+    // Compactions before a metadata pair moves to fresh blocks; -1
+    // disables relocation.
+    block_cycles: Int
+    // The largest filename this volume accepts.  On disk contract, not
+    // a suggestion: a name longer than this cannot be written back by
+    // a reader that respects the superblock.
+    name_max: Int
+    // The largest file.
+    file_max: Int
+    // At or below this, a file's contents live in its directory entry
+    // and cost no data block at all.
+    inline_max: Int
+
+// What a mount found.
+pub struct NvfsVolume
+    geometry: NvfsGeometry
+    superblock: NvfsSuperblock
+    // The winning revision at mount time, which is also what seeds the
+    // allocation cursor.
+    revision: Int
+    // Which block of the root pair won: 0 or 1.
+    active: Int
+
+// The superblock record's contents.
+//
+// The geometry is stored as well as detected, because a mismatch is
+// the one failure a filesystem must refuse rather than work around: an
+// image built for 4 KiB blocks read as 64 KiB ones would find records
+// at plausible offsets and answer nonsense.
+pub struct NvfsSuperblock
+    version: Int
+    block_size: Int
+    block_count: Int
+    name_max: Int
+    inline_max: Int
+    file_max: Int
+    block_cycles: Int
+
+// What a directory entry names.
+pub enum NvfsEntryKind
+    // A subdirectory: the two words are its metadata pair.
+    NvfsKindDirectory
+    // A small file: the contents are in the record and the two words
+    // are unused.
+    NvfsKindInline
+    // A larger file: the two words are the head block of its CTZ chain
+    // and its size in bytes.
+    NvfsKindChain
+
+// One entry of a directory.
+pub struct NvfsEntry
+    name: Str
+    kind: NvfsEntryKind
+    // Kind-dependent: a directory's pair blocks, or a chain's head and
+    // size.  Named for what they are on disk rather than for one of
+    // their three meanings, because a field called `head` would be
+    // wrong for two thirds of the entries.
+    word_first: Int
+    word_second: Int
+    // An inline file's contents, and empty for every other kind.
+    inline_data: Bytes
+
+// The configuration a format uses when the caller does not say.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.default_config().inline_max}")
+// ```
+pub fn default_config() -> NvfsConfig []
+    todo("nvfs-core.nvfsvol.default_config")
+
+// A geometry.
+//
+// A constructor rather than a struct literal, and every struct this
+// module exposes carries one: a struct declared in one module cannot be
+// built with a qualified literal from another, so
+// `nvfsvol.NvfsGeometry { … }` in a caller is a parse error.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.geometry(16, 16, 512, 32).block_count}")
+// ```
+pub fn geometry(read_size: Int, prog_size: Int, block_size: Int,
+                block_count: Int) -> NvfsGeometry []
+    todo("nvfs-core.nvfsvol.geometry")
+
+// A configuration.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.config(100, 64, 4096, 128).inline_max}")
+// ```
+pub fn config(block_cycles: Int, name_max: Int, file_max: Int, inline_max: Int) -> NvfsConfig []
+    todo("nvfs-core.nvfsvol.config")
+
+// A superblock, for a caller building one rather than reading one.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.superblock(65536, 512, 32, 64, 128, 4096, 100).block_size}")
+// ```
+pub fn superblock(version: Int, block_size: Int, block_count: Int, name_max: Int, inline_max: Int,
+                  file_max: Int, block_cycles: Int) -> NvfsSuperblock []
+    todo("nvfs-core.nvfsvol.superblock")
+
+// A volume, for a caller holding the four facts a mount answered.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let sb = nvfsvol.superblock(65536, 512, 32, 64, 128, 4096, 100)
+//     println("${nvfsvol.volume(g, sb, 1, 0).revision}")
+// ```
+pub fn volume(g: NvfsGeometry, sb: NvfsSuperblock, revision: Int, active: Int) -> NvfsVolume []
+    todo("nvfs-core.nvfsvol.volume")
+
+// Whether a configuration fits a geometry, and which error to answer
+// when it does not.
+//
+// `NvfsOk` for a usable pair.  The rules are littlefs's: a name bound
+// between 1 and 255 because it is a byte on disk, an inline threshold
+// no larger than a record may be, a positive file bound, and a
+// relocation threshold that is not zero.
+//
+// ```novo
+// use nvfsgeo
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println(nvfsgeo.error_name(nvfsvol.check_config(nvfsvol.default_config(), g)))
+// ```
+pub fn check_config(c: NvfsConfig, g: NvfsGeometry) -> nvfsgeo.NvfsError []
+    todo("nvfs-core.nvfsvol.check_config")
+
+// The superblock record's type byte.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.record_type_superblock()}")
+// ```
+pub fn record_type_superblock() -> Int []
+    todo("nvfs-core.nvfsvol.record_type_superblock")
+
+// The directory-entry record's type byte.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.record_type_entry()}")
+// ```
+pub fn record_type_entry() -> Int []
+    todo("nvfs-core.nvfsvol.record_type_entry")
+
+// The tombstone record's type byte.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.record_type_tombstone()}")
+// ```
+pub fn record_type_tombstone() -> Int []
+    todo("nvfs-core.nvfsvol.record_type_tombstone")
+
+// The rename record's type byte.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.record_type_rename()}")
+// ```
+pub fn record_type_rename() -> Int []
+    todo("nvfs-core.nvfsvol.record_type_rename")
+
+// The superblock record's payload for this geometry and configuration.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     println("${bytes.len(nvfsvol.encode_superblock(g, nvfsvol.default_config()))}")
+// ```
+pub fn encode_superblock(g: NvfsGeometry, c: NvfsConfig) -> Bytes []
+    todo("nvfs-core.nvfsvol.encode_superblock")
+
+// A superblock payload read back, or the error that refuses it.
+//
+// `NvfsCorrupt` for a bad magic, `NvfsVersionUnsupported` for a major
+// version this library does not know.  A geometry MISMATCH is not
+// decided here — this answers what the payload says, and comparing it
+// with the device is `nvfsop`'s job, because the device is the part
+// this module has no access to.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     match nvfsvol.decode_superblock(bytes.zeros(32))
+//         Err(_) => println("refused")
+//         Ok(sb) => println("${sb.block_size}")
+// ```
+pub fn decode_superblock(payload: Bytes) -> Result<NvfsSuperblock, nvfsgeo.NvfsError> []
+    todo("nvfs-core.nvfsvol.decode_superblock")
+
+// Whether a superblock describes the device it was read from.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     match nvfsvol.decode_superblock(bytes.zeros(32))
+//         Err(_) => println("refused")
+//         Ok(sb) => println("${nvfsvol.geometry_matches(sb, nvfsvol.geometry(16, 16, 512, 32))}")
+// ```
+pub fn geometry_matches(sb: NvfsSuperblock, g: NvfsGeometry) -> Bool []
+    todo("nvfs-core.nvfsvol.geometry_matches")
+
+// A directory entry naming a subdirectory's pair.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println(nvfsvol.directory_entry("logs", 4, 5).name)
+// ```
+pub fn directory_entry(name: Str, pair_first: Int, pair_second: Int) -> NvfsEntry []
+    todo("nvfs-core.nvfsvol.directory_entry")
+
+// A directory entry holding a small file's whole contents.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     println(nvfsvol.inline_entry("boot", bytes.from_byte_list([1])).name)
+// ```
+pub fn inline_entry(name: Str, data: Bytes) -> NvfsEntry []
+    todo("nvfs-core.nvfsvol.inline_entry")
+
+// A directory entry naming a file's CTZ chain and its size.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.chain_entry("big", 41, 4096).word_second}")
+// ```
+pub fn chain_entry(name: Str, head_block: Int, size: Int) -> NvfsEntry []
+    todo("nvfs-core.nvfsvol.chain_entry")
+
+// A file's size in bytes; zero for a directory.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.entry_size(nvfsvol.chain_entry("big", 41, 4096))}")
+// ```
+pub fn entry_size(e: NvfsEntry) -> Int []
+    todo("nvfs-core.nvfsvol.entry_size")
+
+// Whether an entry names a directory.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.entry_is_directory(nvfsvol.directory_entry("logs", 4, 5))}")
+// ```
+pub fn entry_is_directory(e: NvfsEntry) -> Bool []
+    todo("nvfs-core.nvfsvol.entry_is_directory")
+
+// Whether an entry's pair words could name real blocks.
+//
+// A dirent whose two words are equal, or outside the device, is
+// `NvfsCorrupt` rather than a walk into nowhere — the one check that
+// stops a damaged directory from sending a read off the end of the
+// part.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 5), 32)}")
+// ```
+pub fn entry_pair_is_plausible(e: NvfsEntry, block_count: Int) -> Bool []
+    todo("nvfs-core.nvfsvol.entry_pair_is_plausible")
+
+// An entry's record payload.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsvol.encode_entry(nvfsvol.directory_entry("logs", 4, 5)))}")
+// ```
+pub fn encode_entry(e: NvfsEntry) -> Bytes []
+    todo("nvfs-core.nvfsvol.encode_entry")
+
+// An entry payload read back, or `None` when the payload is shorter
+// than its own header claims.
+//
+// A payload that passed its CRC cannot be short, so `None` here means
+// a caller decoded something that was not an entry record — which is
+// worth answering rather than folding into a zero-valued entry the
+// walk would then reject somewhere else.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     match nvfsvol.decode_entry(bytes.zeros(2))
+//         None    => println("not an entry")
+//         Some(e) => println(e.name)
+// ```
+pub fn decode_entry(payload: Bytes) -> ?NvfsEntry []
+    todo("nvfs-core.nvfsvol.decode_entry")
+
+// A tombstone's record payload.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsvol.encode_tombstone("boot"))}")
+// ```
+pub fn encode_tombstone(name: Str) -> Bytes []
+    todo("nvfs-core.nvfsvol.encode_tombstone")
+
+// A rename's record payload: both names, in one record.
+//
+// ```novo
+// use std.bytes
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${bytes.len(nvfsvol.encode_rename("boot", "boot.old"))}")
+// ```
+pub fn encode_rename(old_name: Str, new_name: Str) -> Bytes []
+    todo("nvfs-core.nvfsvol.encode_rename")
+
+// A directory's live entries: the fold over its log, in order.
+//
+// An entry record upserts by name, a tombstone removes, a rename
+// moves.  The whole of "what is in this directory", and the reason
+// there is no index to keep consistent.
+//
+// ```novo
+// use std.list
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${list.len(nvfsvol.fold([]))}")
+// ```
+pub fn fold(records: [nvfsmeta.NvfsRecord]) -> [NvfsEntry] []
+    todo("nvfs-core.nvfsvol.fold")
+
+// The entry a name denotes, or `None`.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     match nvfsvol.find([], "boot")
+//         None    => println("not found")
+//         Some(e) => println(e.name)
+// ```
+pub fn find(entries: [NvfsEntry], name: Str) -> ?NvfsEntry []
+    todo("nvfs-core.nvfsvol.find")
+
+// The superblock payload a log carries, or `None`.
+//
+// Only the root pair has one, which is what tells a walk it reached
+// the root rather than a subdirectory that happens to be at blocks 0
+// and 1.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     match nvfsvol.find_superblock([])
+//         None    => println("not the root")
+//         Some(_) => println("the root")
+// ```
+pub fn find_superblock(records: [nvfsmeta.NvfsRecord]) -> ?Bytes []
+    todo("nvfs-core.nvfsvol.find_superblock")
+
+// The record set a compaction must preserve: the superblock, if the
+// log has one, and one entry record per live entry.
+//
+// Computed by the caller and handed to `nvfsmeta`, which is what keeps
+// the log machinery domain-free.
+//
+// ```novo
+// use std.list
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${list.len(nvfsvol.compaction_records([]))}")
+// ```
+pub fn compaction_records(records: [nvfsmeta.NvfsRecord]) -> [nvfsmeta.NvfsRecord] []
+    todo("nvfs-core.nvfsvol.compaction_records")
+
+// A path split into components, with empty ones dropped.
+//
+// So `/a//b/` and `a/b` both give `["a", "b"]`.  Every caller here
+// indexes components positionally and would otherwise see phantom
+// empty names.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.path_components("/a//b/")}")
+// ```
+pub fn path_components(path: Str) -> [Str] []
+    todo("nvfs-core.nvfsvol.path_components")
+
+// A path's last component, and the empty string for the root.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println(nvfsvol.basename("/a/b"))
+// ```
+pub fn basename(path: Str) -> Str []
+    todo("nvfs-core.nvfsvol.basename")
+
+// Whether a name is one this volume accepts.
+//
+// Non-empty, no separator in it, and no longer than the superblock's
+// bound — checked against the SUPERBLOCK rather than the running
+// configuration, because the bound is an on-disk contract and a reader
+// with a larger setting must not write a name an older reader cannot
+// hold.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.name_is_valid("boot", 64)}")
+// ```
+pub fn name_is_valid(name: Str, name_max: Int) -> Bool []
+    todo("nvfs-core.nvfsvol.name_is_valid")
+
+// Whether two paths name entries in the same directory.
+//
+// The one rename this format can commit atomically, so it is the one
+// it does.  A caller is told which kind it has before the operation
+// starts rather than by `NvfsNotSupported` after it.
+//
+// ```novo
+// use nvfsvol
+//
+// fn main() [io]
+//     println("${nvfsvol.same_parent("/a/b", "/a/c")}")
+// ```
+pub fn same_parent(old_path: Str, new_path: Str) -> Bool []
+    todo("nvfs-core.nvfsvol.same_parent")
