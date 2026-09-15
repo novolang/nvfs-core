@@ -1,6 +1,6 @@
 [package]
 name        = "nvfs-core"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "A littlefs-class filesystem with no device attached: the superblock, the metadata pairs and their commit-and-seal cycle, the CTZ skip-list, the directory entries, and every operation from mount to fsck as a state machine that ANSWERS the block reads and writes a host must perform.  littlefs's four lfs_config callbacks turned into a value, so the format is exercised against a byte array and a power cut is a test that stops feeding answers.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

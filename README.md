@@ -1,52 +1,79 @@
 # nvfs-core
 
-A littlefs-class filesystem with the device left out: the on-disk
-format, the commit cycle and every operation as a state machine that
-**answers** the block reads and writes a host must perform.
+A **filesystem for raw flash** is one that manages the erase blocks of a
+memory chip directly, with no disk controller underneath. This package is the
+on-disk format and every operation of such a filesystem, in the style of
+[littlefs](https://github.com/littlefs-project/littlefs), whose `DESIGN.md`
+is the reference. It performs no input or output: it **answers** the block
+reads and writes a caller must perform, and the caller performs them. It is
+built on [crc-nv](https://novo-lang.org/packages/crc-nv).
 
-**Status: NOT IMPLEMENTED — interface only.**  Every `pub fn` body is a
-`todo()`, so the signatures, the effect rows and the tests are published
-and nothing is implemented.  The first implementation is the `0.1.0`
-published over this.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
+its full signature, but every body is a `todo()` that panics when called. The
+package is published so its design can be reviewed and depended on before it
+is implemented. Version 0.1.0 will be the first working release.
 
-## What this is
+## What it is
 
-`orbit/novofs` is a power-loss-resilient filesystem for raw NOR flash —
-metadata pairs, CRC'd commit logs, CTZ skip-lists, copy-on-write by
-construction — and it is an `app`, because its filesystem calls a
-`Flash` trait whose every method is `[io, hw, mutate]`.  That is the
-inversion littlefs has too: four function pointers in an `lfs_config`,
-called from inside.
+NOR flash has three properties that decide the whole design. A write can
+only clear bits, never set them. Setting bits again means **erasing**, and
+erasing works on a whole **block** at a time. A block wears out after some
+tens of thousands of erases. On top of that, the power can go at any moment,
+including in the middle of a write.
 
-This package is the same filesystem with the call turned around.  The
-state machine **returns** the action and the host performs it, so the
-format is arithmetic over bytes the caller already holds, the package is
-`core` with an empty effect budget, and three of its six modules link
-for a Cortex-M.
+A filesystem for such a part is therefore append-only, copy-on-write, and
+careful about the order in which it writes things.
 
-| module | holds | device |
-| --- | --- | --- |
-| `nvfsgeo` | the block and record layout, and the error set | ✓ |
-| `nvfsctz` | the CTZ skip-list, and a walk as three integers | ✓ |
-| `nvfswear` | arbitration, allocation, and the power-loss rules | ✓ |
-| `nvfsmeta` | the record log, its scan and its commit-and-seal cycle | |
-| `nvfsvol` | the superblock, the entries, and the directory fold | |
-| `nvfsop` | every operation as a machine, and `NvfsAction` | |
+A **metadata pair** is two erase blocks holding the same directory, as an
+append-only log. Each block begins with a **revision number** and then a
+sequence of records. The block whose revision is higher and **sealed** is the
+live one. When a block fills, the filesystem **compacts**: it writes the live
+contents into the other block of the pair, and seals it last.
 
-## Adding it, and checking it
+A **record** is one change: an entry created, an entry removed, a file
+renamed. Each record carries its own checksum. That is the whole of the crash
+resistance: a record that was completely written is valid, and one that was
+not is not.
 
-```console
-$ novo pkg add nvfs-core
-$ novo pkg build
-$ novo test tests/nvfsop_tests.nv
+```
+[ revision u32 | pad to meta_offset | record | record | 0xFF free ... ]
+  record = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ]
 ```
 
-`novo pkg add` says `NOT IMPLEMENTED — interface only` on the way in,
-because an interface resolves, downloads and builds exactly like an
-implemented package and the difference only shows the first time
-something calls it.
+A small file lives inside its directory entry and costs no block of its own.
+A larger one is a **CTZ skip-list**: a chain of blocks in which the block at
+index `n` holds pointers back to `n - 1`, `n - 2`, `n - 4` and so on, so that
+seeking to any position takes a number of steps proportional to the logarithm
+of the file's length. Writing appends and never rewrites an earlier block.
 
-## The one example that will work
+The thing that makes this package usable without hardware is that the
+**direction of the call is reversed**. littlefs is given four function
+pointers and calls them from inside. Here an operation is a machine: it is
+started, and each step answers either an action to perform, or the result, or
+a failure. A caller performs the action and resumes the machine with the
+answer.
+
+```
+NvfsRead(block, off, len)    NvfsProg(block, off, data)
+NvfsErase(block)             NvfsSync
+```
+
+| Quantity | Value |
+| --- | --- |
+| Blocks in a metadata pair | 2 |
+| Erased byte | 0xFF |
+| Records per mutation | 1 |
+| Actions the machine can ask for | 4 |
+| Pointers per block in the skip-list | the same number in every block |
+| Revision number | 32 bits, wrapping after about 136 years at one compaction a second |
+
+## Install
+
+```
+novo pkg add nvfs-core
+```
+
+## Example
 
 ```novo
 use std.bytes
@@ -54,230 +81,204 @@ use nvfsop
 use nvfsvol
 
 fn main() [io]
+    // The part's geometry: read size, program size, block size, block count.
     let g = nvfsvol.geometry(16, 16, 512, 32)
+
+    // Begin a mount. Nothing has been read yet.
     var p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
     var running = true
     while running
         match p.step
+            // The machine wants an action performed. A real driver talks to
+            // the part here; this one answers as an erased device would.
             NvfsNeed(a) =>
                 match a
-                    // A real driver reads the part here; this one has
-                    // an erased device, which is what a fresh board has.
                     NvfsRead(_, _, len) => p = nvfsop.resume_read(p.machine, bytes.zeros(len))
                     _                   => p = nvfsop.resume_ok(p.machine, true)
-            NvfsDone(_)   =>
+            NvfsDone(_) =>
                 println("mounted")
                 running = false
             NvfsFailed(_) =>
-                println("no filesystem — format it")
+                println("no filesystem, so format it")
                 running = false
 ```
 
-## The load-bearing interface
+Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
+on purpose: every test reaches a `not implemented` panic. The tests are the
+specification the implementation will have to satisfy.
 
-`NvfsAction` — littlefs's four `lfs_config` callbacks turned into
-values.
+## What the package contains
 
-```novo norun:pseudo
-pub enum NvfsAction
-    NvfsRead(block: Int, off: Int, len: Int)
-    NvfsProg(block: Int, off: Int, data: Bytes)
-    NvfsErase(block: Int)
-    NvfsSync
-```
-
-The signatures are the callbacks' own; what changed is **who makes the
-call**.  Three things follow that could not before.
-
-**1. The whole format is exercisable against a byte array.**  There is
-no device to stand up, no trait to implement and no `[io]` anywhere: a
-test answers `NvfsRead` out of a `Bytes` it built by hand.
-`tests/nvfsop_tests.nv` drives a format and a mount to completion in
-forty lines, and the "device" in it is a `while` loop.
-
-**2. A power cut is a test that stops feeding answers.**  `orbit/novofs`
-proves its crash resistance with a **1096-cut torture harness** built
-around a fault-injecting RAM device that can tear a program mid-page and
-fail every operation after it.  Here, a cut at action N is: run N
-actions, stop, and mount what the array holds.  Every one of those 1096
-cuts is reachable with no device at all, and `actions_taken` is what
-makes "cut at N" addressable.  The harness stops being a fixture and
-becomes a loop.
-
-**3. One machine serves every device.**  A QEMU flash, a file-backed
-image and a real NOR part differ in who performs the action and in
-nothing else, so there is no trait parameter and nothing to instantiate
-per device.
-
-The cost, stated: the machine holds its own state, so a caller drives a
-loop rather than calling a function.  That is the same trade `btree-nv`
-makes with `PageRequest`, and for the same reason — the one operation
-that touches the machine is the only one this package refuses to do.
-
-## The device claim, and what it covers
-
-`tests/embedded_probe.nv` builds for `--target=nrf52-qemu` and produces
-a real Cortex-M4 ELF.  It covers `nvfsgeo`, `nvfsctz` and `nvfswear` —
-the layout arithmetic, the skip-list walk and the wear and arbitration
-rules — which between them own two `@value` structs of three `Int`s each
-and no other type at all.  Those three are what a firmware runs in a
-loop: seek into a file, decide whether a commit fits, pick a free block,
-arbitrate a pair.
-
-`nvfsmeta`, `nvfsvol` and `nvfsop` are **not** claimed.  A record holds
-`Bytes`, a directory fold builds a list of entries, and the machine
-holds an action whose payload is a buffer — every one of them allocates
-by construction and not by accident.  A firmware that wants those wants
-a heap; a firmware that wants to walk a chain and commit a record into a
-buffer it already owns wants exactly the three that are claimed.
-
-What the tier checks at `0.0.1` is narrower than it will be: every body
-is a `todo()`, so what links today is the signatures and the types.
-There is no walk in the binary yet, so the probe does not prove a seek
-is allocation-free; it proves that nothing in the shape of the surface
-needs an allocator or a host.  Keeping it green once the bodies land is
-a named cost of the implementation step.
-
-`heapless-nv` is the package a firmware pairs this with, and it is
-deliberately **not** a dependency: the buffers — the block image, the
-record being built — are the caller's, which is the rule heapless-nv
-itself follows.
-
-## The format, in one page
-
-A **metadata pair** is two erase blocks holding an append-only log:
-
-```
-[ revision u32 | pad to meta_offset | record | record | 0xFF free … ]
-  meta_offset = max(4, prog_size)
-  record      = [ type u8 | flags u8 | len u16 | payload | crc32c u32 ]
-```
-
-The block with the higher **sealed** revision is active.  Four rules
-carry the whole of the crash resistance, and each of them is a function
-in this package rather than a paragraph:
-
-- **Every mutation is exactly one self-CRC'd record**, so per-record
-  atomicity is the entire story.  A rename is **one** record — not a
-  tombstone and an entry — which is why a power cut cannot lose the
-  file, and why a cross-directory move is `NvfsNotSupported` rather than
-  done unsafely: that one would be two records in two pairs.
-- **A compaction seals the revision word last**, on its own prog page.
-  `nvfsgeo.meta_offset` is the padding that makes it possible, and
-  `orbit/novofs` learned it as a format change that is not backward
-  compatible: the first shape packed records against the revision word,
-  so one prog page could carry both a partial record and a live
-  revision, and neither outcome was recoverable.
-- **A torn append ends the log and marks the block full**
-  (`nvfswear.append_allowed`).  NOR programming only clears bits, so a
-  garbage tail cannot be rewritten and the next commit must compact.
-- **Free means "not reached from the root"**, never a free list.  A
-  crash between allocating a block and committing the record that names
-  it leaves the block unreachable, and unreachable is free — so the
-  crash costs nothing and there is no stale list to repair.  The
-  rotating cursor is a wear policy on top of that, and changing its pick
-  order can waste a block and can never corrupt a volume.
-
-A file at or below `inline_max` lives in its directory entry and costs
-no data block.  A larger one is a **CTZ skip-list**: a backwards chain
-whose block at index `n` points at `n-1`, `n-2`, `n-4`, … so a seek is
-O(log n).  Writing appends and never rewrites an earlier block, which is
-what makes a file copy-on-write by construction.
-
-**One deliberate divergence from littlefs**, inherited from
-`orbit/novofs` and named so it can be revisited: the CTZ capacity is
-**uniform**.  littlefs packs `ctz(n) + 1` pointers into block `n`, so
-most blocks carry one and the capacity depends on the index; this
-reserves K slots in every block, which wastes `4 * (K - ctz(n) - 1)`
-bytes per block and makes `offset -> index` a single division.
-`nvfsctz.capacity` is the one function that would change.
-
-## What `orbit/novofs` keeps, and what it takes
-
-**novofs keeps** the driver, which is everything that touches a machine:
-
-| file | why it stays |
+| Module | Contents |
 | --- | --- |
-| `src/flash.nv` | the `Flash` trait, `RamFlash` with its strict NOR semantics and power-cut injection, `FileFlash` over an image file |
-| `src/haladapt.nv` | the adapter from `hal.BlockDevice` to `Flash` |
-| `src/vfs.nv` | the `FileSystem` trait consumers program against |
-| `src/main.nv` | the image-tool CLI — `mk`, `ls`, `cat`, `extract`, `fsck`, `df` |
+| `nvfsgeo` | The block and record layout as integer arithmetic, and the error set. |
+| `nvfsctz` | The skip-list: how many pointers a block holds, which block an offset falls in, and a walk held as three integers. |
+| `nvfswear` | Which block of a pair wins, where the next free block comes from, when a block should be moved, and the three power-loss rules. |
+| `nvfsmeta` | The record log: building a record, scanning a block's bytes into records, and the three images a commit writes. |
+| `nvfsvol` | The superblock, the four record types, the directory entries, and the fold that turns a log into a directory. |
+| `nvfsop` | Every operation from mount to check, each as a machine, and the action it asks for. |
 
-**novofs takes**, replacing code it has today:
+## How to choose an entry point
 
-| novofs symbol | this package |
-| --- | --- |
-| `nvfs.FsConfig` / `nvfs.default_config` / `nvfs.validate` | `nvfsvol.NvfsConfig`, `nvfsvol.default_config`, `nvfsvol.check_config` |
-| `nvfs.FsError` / `nvfs.err_str` | `nvfsgeo.NvfsError`, `nvfsgeo.error_name` |
-| `nvfs.FsInfo` / `nvfs.MountRes` / `nvfs.parse_sb` / `nvfs.sb_payload` | `nvfsvol.NvfsVolume`, `nvfsvol.NvfsSuperblock`, `nvfsvol.decode_superblock`, `nvfsvol.encode_superblock` |
-| `nvfs.DirEntry` / `mk_dir_entry` / `mk_inline_entry` / `mk_ctz_entry` / `enc_dirent` / `dec_dirent` | `nvfsvol.NvfsEntry` and the four constructors and codecs beside it |
-| `nvfs.fold_dir` / `entries_find` / `compaction_recs` | `nvfsvol.fold`, `nvfsvol.find`, `nvfsvol.compaction_records` |
-| `nvfs.path_comps` / `last_comp` | `nvfsvol.path_components`, `nvfsvol.basename` |
-| `nvfs.ctz_k` / `ctz_cap` / `ctz_nblocks` / `ctz_seek` / `ctz_ptr` | `nvfsctz.pointer_count`, `capacity`, `block_count_for`, the `NvfsCtzWalk` walk, `pointer_offset` |
-| `nvfs.alloc_blocks`' cursor / `alloc_cursor` / `maybe_relocate`'s threshold | `nvfswear.NvfsAlloc`, `cursor_seed`, `should_relocate` |
-| `nvfs.sb_cycles_enc` / `sb_cycles_dec` | `nvfswear.encode_block_cycles`, `decode_block_cycles` |
-| `meta.MetaRec` / `MetaScan` / `mk_rec` / `build_record` / `scan` | `nvfsmeta.NvfsRecord`, `NvfsScan`, `record`, `encode_record`, `scan_block` |
-| `meta.meta_off` / `align_up` / `pad_to` / `recs_size` | `nvfsgeo.meta_offset`, `nvfsgeo.align_up`, `nvfsmeta.pad_to`, `nvfsmeta.records_span` |
-| `meta.append_at` / `compact_to` | `nvfsmeta.append_image`, `compaction_image`, `seal_image` — three images the driver programs, rather than three calls that program |
-| `nvfs.pair_state` / `ps_*` | `nvfsmeta.arbitrate`, `NvfsPairState` |
-| `src/crc32.nv` (the whole file) | `nvfsmeta.record_crc`, over **crc-nv** |
-| `nvfs.format` / `mount` / `mkdir` / `dir_list` / `remove` / `rename` / `file_read` / `file_read_at` / `file_write` / `file_append` / `file_truncate` / `file_size` | one `NvfsOp` each, driven through `nvfsop.begin` / `resume_read` / `resume_ok` |
+**A driver uses `nvfsop` and nothing else.** `begin` starts an operation,
+`resume_read` answers a read, and `resume_ok` answers a write, an erase or a
+sync. Every operation has the same shape, so the loop is written once.
 
-What novofs **gains**: its `RamFlash` power-cut harness stops being the
-only way to test a cut, its `crc32.nv` deletes, and the twelve
-filesystem entry points become one loop.  What it **keeps paying**: the
-loop is the driver's, so `vfs.NovoFs`'s ten methods each wrap one.
+**A firmware that only walks a chain uses `nvfsctz` directly.** Seeking into
+a file, deciding whether a commit fits and picking a free block are
+arithmetic, and those three modules do them with no allocator. See "Running
+on a microcontroller".
 
-## What widened, and it is named rather than hidden
+**A tool that reads an image out of a file uses the same machine.** A QEMU
+flash, a file-backed image and a real part differ in who performs the action
+and in nothing else, so there is no trait to implement per device and nothing
+to instantiate.
 
-**File handles.**  `orbit/novofs` is path-based and stateless — every
-operation walks from the root — so an append is O(n): it reads the whole
-file and writes it back.  Its own README names the fix ("an O(1) tail
-append needs file handles").  `NvfsOpen`, `NvfsSeek` and `NvfsClose` are
-that fix, and they exist here because the state machine has a place to
-keep a cursor that the stateless API had nowhere to put.  The cost is
-stated: a handle is a number the machine remembers, so a host that drops
-a machine drops its handles, and there is nothing on disk to make stale.
+## The rules a user needs
 
-**fsck as an operation.**  novofs's `fsck` is a CLI verb over the `vfs`
-trait; here it is `NvfsCheck`, one `NvfsOp` like the others, answering a
-report rather than printing one.
+1. **Every mutation is exactly one record, and the record carries its own
+   checksum.** That is the whole of the crash story. A power cut either lands
+   before the record, in which case nothing happened, or after it, in which
+   case it all happened.
+2. **A rename is one record, not a removal and a creation.** That is why a
+   power cut cannot lose the file. A move between directories would be two
+   records in two pairs, so it answers `NvfsNotSupported`.
+   `nvfsvol.same_parent` is how a caller finds out before it starts.
+3. **A compaction seals the revision word last, on its own program page.**
+   `nvfsgeo.meta_offset` is the padding that makes that possible. Without it
+   one program page could carry a partial record and a live revision at once,
+   and neither outcome is recoverable.
+4. **A torn append ends the log and marks the block full.** Programming NOR
+   flash only clears bits, so a garbage tail cannot be rewritten. The next
+   commit must compact. `nvfswear.append_allowed` is the rule.
+5. **Free means not reachable from the root, and there is no free list.** A
+   crash between allocating a block and committing the record that names it
+   leaves the block unreachable, and unreachable is free. The crash therefore
+   costs nothing and there is no stale list to repair.
+6. **The allocation cursor is a wear policy, not correctness.** Changing the
+   order it picks in can waste a block and can never corrupt a volume.
+7. **A file at or below the inline limit lives in its directory entry.** It
+   costs no data block. `nvfsctz.is_inline` answers whether a given length
+   does.
+8. **The skip-list reserves the same number of pointers in every block.**
+   littlefs varies it with the index, which packs more data into most blocks
+   but makes converting an offset to a block index a loop. Here it is one
+   division, at the cost of some wasted bytes per block. `nvfsctz.capacity`
+   is the one function that would change.
+9. **A volume written by this format will not mount under littlefs, and the
+   reverse.** The format is littlefs-inspired, not littlefs-compatible.
+10. **`nvfsop.actions_taken` is what makes a power cut addressable.** Run a
+    machine for a given number of actions, stop feeding it, and mount what
+    the array holds. Every cut in a test suite is that loop.
+11. **A file handle lives in the machine, not on the device.** A host that
+    drops a machine drops its handles, and there is nothing on the flash to
+    become stale.
+12. **Revision wraparound is undefined.** The revision is a 32-bit number and
+    wraps after about 136 years at one compaction a second.
+    `nvfswear.revision_near_wrap` exists so that a long-lived logger detects
+    the limit rather than meeting it.
 
-## Two deferrals kept, by name
+## Running on a microcontroller
 
-- **Cross-directory rename** is `NvfsNotSupported`.  It needs littlefs's
-  global move state — two pairs committed together — which this format
-  cannot express.  `nvfsvol.same_parent` is how a caller finds out
-  before it starts.
-- **Revision wraparound is undefined.**  The revision is a u32 and at
-  one compaction a second it wraps in about 136 years.
-  `nvfswear.revision_near_wrap` exists so a long-lived logger can detect
-  the deferral rather than meet it.
+The package states that its modules run on a device with no heap allocator,
+and the compiler checks that claim on every build. Here it covers `nvfsgeo`,
+`nvfsctz` and `nvfswear`: the layout arithmetic, the skip-list walk, and the
+wear and arbitration rules. Between them they own two `@value` structs of
+three integers each and no other type at all. Those three are what a firmware
+runs in a loop: seek into a file, decide whether a commit fits, pick a free
+block, choose between the two blocks of a pair.
 
-## The reference implementation
+`tests/embedded_probe.nv` is that claim as a program that either builds or
+does not.
 
-littlefs (BSD-3-Clause) — its `DESIGN.md` is the specification for the
-metadata pair, the CTZ skip-list and the wear rules, and `lfs_config` is
-the shape `NvfsAction` inverts.  `orbit/novofs` is the second reference:
-it is this format already written in novo-lang, with a 110-check
-functional suite, a 1096-cut power-loss harness and twelve CLI checks
-behind it, and those are the vectors the bodies will be measured
-against.  The on-disk format is littlefs-*inspired* rather than
-littlefs-compatible, and it stays that way: a volume written by one will
-not mount on the other.
-
-## Status
-
-Every function is `todo()`.  The six suites under `tests/` are red on
-`not implemented`, which is the expected result until the bodies land,
-and `tests/embedded_probe.nv` is not a test — it is the device claim,
-built by `scripts/shard_audit.sh`'s `core-embedded` row.
-
-```console
-$ novo test tests/nvfsgeo_tests.nv
-$ novo test tests/nvfsctz_tests.nv
-$ novo test tests/nvfswear_tests.nv
-$ novo test tests/nvfsmeta_tests.nv
-$ novo test tests/nvfsvol_tests.nv
-$ novo test tests/nvfsop_tests.nv
+```bash
+novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
+
+That command was run against this release. It produces a Cortex-M4
+executable, `embedded_probe.elf`. The probe builds; it is not run, because
+every function it calls is a `todo()` that would panic on the first line.
+
+`nvfsmeta`, `nvfsvol` and `nvfsop` are outside the claim. A record holds
+`Bytes`, a directory fold builds a list of entries, and an action's payload
+is a buffer. Every one of those allocates by construction.
+
+What the probe checks in this release is narrower than what it will check.
+Every body is a `todo()`, so what links today is the signatures and the
+types: nothing in the shape of the surface needs an allocator or an operating
+system. It does not yet prove that a seek allocates nothing. Keeping it
+building once the bodies land is a cost of the implementation step.
+
+## What is not included
+
+- **A flash driver.** Nothing here reads or writes a part. The four actions
+  are what a driver performs.
+- **Cross-directory rename.** See rule 2.
+- **Compatibility with littlefs on disk.** See rule 9.
+- **A buffer.** The block image and the record being built are the caller's.
+  [heapless-nv](https://novo-lang.org/packages/heapless-nv) is where a
+  firmware's would come from, and it is deliberately not a dependency for
+  that reason.
+- **A second checksum implementation.** The record checksum is crc-nv's.
+- **A path cache.** Every operation walks from the root.
+
+## Related packages
+
+- [crc-nv](https://novo-lang.org/packages/crc-nv) is the record checksum.
+- [heapless-nv](https://novo-lang.org/packages/heapless-nv) is the
+  fixed-capacity storage a firmware pairs this with.
+- [bbqueue-nv](https://novo-lang.org/packages/bbqueue-nv) is the other
+  storage-shaped package for a device, for bytes in flight rather than bytes
+  at rest.
+- [dfu-nv](https://novo-lang.org/packages/dfu-nv) writes a firmware image to
+  flash. It erases and programs the same kind of part, with no filesystem on
+  it.
+- [btree-nv](https://novo-lang.org/packages/btree-nv) is the on-disk index
+  for a database. It takes the same shape as this package: the caller
+  performs the page read and the library asks for it.
+- `std.fs` in the standard library is the operating system's filesystem. It
+  is what a program on a host uses, and there is none of it on a device.
+
+## Tests
+
+```bash
+novo test                             # 60 tests
+novo test tests/nvfsgeo_tests.nv      # 11: the layout arithmetic
+novo test tests/nvfsctz_tests.nv      #  8: the skip-list and the seek
+novo test tests/nvfswear_tests.nv     # 10: arbitration, allocation, the power-loss rules
+novo test tests/nvfsmeta_tests.nv     #  8: the record log and the commit cycle
+novo test tests/nvfsvol_tests.nv      # 12: the superblock, the entries, the fold
+novo test tests/nvfsop_tests.nv       # 11: a format and a mount, driven to completion
+```
+
+littlefs's `DESIGN.md` is the specification for the metadata pair, the
+skip-list and the wear rules, and its `lfs_config` is the shape the four
+actions invert.
+
+No test opens a device. Every read is answered out of a byte array the test
+built by hand, and the device in `tests/nvfsop_tests.nv` is a `while` loop.
+
+The tests compile today and fail at run, each on the `not implemented` panic
+that is its body. That is the expected state of an interface release. They
+turn green one at a time as bodies land.
+
+## Implementation status
+
+| Item | Implemented |
+| --- | --- |
+| `nvfsgeo.NvfsError`, `nvfsctz.NvfsCtzWalk`, `nvfswear.NvfsAlloc` | declared |
+| `nvfsmeta.NvfsRecord`, `.NvfsScan`, `.NvfsPair`, `.NvfsPairState` | declared |
+| `nvfsvol.NvfsGeometry`, `.NvfsConfig`, `.NvfsVolume`, `.NvfsSuperblock`, `.NvfsEntryKind`, `.NvfsEntry` | declared |
+| `nvfsop.NvfsAction`, `.NvfsAnswer`, `.NvfsOp`, `.NvfsResult`, `.NvfsReport`, `.NvfsStep`, `.NvfsProgress`, `.NvfsMachine` | declared |
+| `nvfsgeo`: the layout arithmetic and the geometry check | no |
+| `nvfsctz`: the pointer arithmetic, the walk and the seek | no |
+| `nvfswear`: arbitration, allocation, sealing and the wear counters | no |
+| `nvfsmeta`: the record, the scan and the three commit images | no |
+| `nvfsvol`: the superblock, the entries, the fold and the path handling | no |
+| `nvfsop`: `begin`, `resume_read`, `resume_ok` and the accessors | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
