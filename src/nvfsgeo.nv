@@ -74,6 +74,21 @@ pub enum NvfsError
     // littlefs's global move state.
     NvfsNotSupported
 
+// `NvfsError` is an `Error`, which is what lets
+// `Result<T, NvfsError>` exist at all — `nvfsvol.decode_superblock`
+// is the one signature in this package that answers a `Result`
+// rather than the bare enum, and this is the impl it requires.
+impl Error for NvfsError
+    // The one-line message, built around `nvfsgeo.error_name`.
+    //
+    // `NvfsOk` is an arm of this enum because it is the zero of the
+    // error set rather than a separate success type, so its message
+    // says that nothing went wrong rather than naming a fault.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("nvfs-core.NvfsError.message")
+
 // The error's own name, for a message or a log line.
 //
 // ```novo
