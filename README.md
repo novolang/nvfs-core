@@ -75,6 +75,8 @@ novo pkg add nvfs-core
 
 ## Example
 
+This example compiles; every call in it panics until 0.1.0.
+
 ```novo
 use std.bytes
 use nvfsop
@@ -195,13 +197,18 @@ does not.
 novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-That command was run against this release. It produces a Cortex-M4
-executable, `embedded_probe.elf`. The probe builds; it is not run, because
-every function it calls is a `todo()` that would panic on the first line.
+The command produces a Cortex-M4 executable, `embedded_probe.elf`. The probe
+builds and is not run, because every function it calls is a `todo()` that
+would panic on the first line.
 
 `nvfsmeta`, `nvfsvol` and `nvfsop` are outside the claim. A record holds
 `Bytes`, a directory fold builds a list of entries, and an action's payload
 is a buffer. Every one of those allocates by construction.
+
+The registry lists all six modules at every tier, the embedded tier
+included. Its tier check admits a module that allocates, because a device
+program has a heap of fixed size. The claim in this section is narrower:
+`nvfsgeo`, `nvfsctz` and `nvfswear` allocate nothing at all.
 
 What the probe checks in this release is narrower than what it will check.
 Every body is a `todo()`, so what links today is the signatures and the
@@ -216,17 +223,19 @@ building once the bodies land is a cost of the implementation step.
 - **Cross-directory rename.** See rule 2.
 - **Compatibility with littlefs on disk.** See rule 9.
 - **A buffer.** The block image and the record being built are the caller's.
-  [heapless-nv](https://novo-lang.org/packages/heapless-nv) is where a
-  firmware's would come from, and it is deliberately not a dependency for
-  that reason.
+  A firmware keeps them in the language's fixed-capacity collections,
+  `Vec[T; N]` and its family (SPEC section 14.8).
 - **A second checksum implementation.** The record checksum is crc-nv's.
 - **A path cache.** Every operation walks from the root.
 
 ## Related packages
 
 - [crc-nv](https://novo-lang.org/packages/crc-nv) is the record checksum.
-- [heapless-nv](https://novo-lang.org/packages/heapless-nv) is the
-  fixed-capacity storage a firmware pairs this with.
+- A block device, as
+  [embedded-hal-nv](https://novo-lang.org/packages/embedded-hal-nv)'s
+  `BlockDevice` trait defines it, performs the block reads, writes and
+  erases this package answers. A firmware's flash driver satisfies that
+  trait, and the firmware hands each action this package answers to it.
 - [bbqueue-nv](https://novo-lang.org/packages/bbqueue-nv) is the other
   storage-shaped package for a device, for bytes in flight rather than bytes
   at rest.

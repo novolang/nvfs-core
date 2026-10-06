@@ -5,6 +5,25 @@ All notable changes to nvfs-core are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-10-06
+
+README and comments only.  No signature, type or effect row changed, and
+every body is still `todo()`.
+
+### Changed
+
+- The README names a block device, as embedded-hal-nv's `BlockDevice`
+  trait defines it, as what performs this package's block actions, and
+  the language's fixed-capacity collections (SPEC section 14.8) as a
+  firmware's buffers.  It named heapless-nv, which is withdrawn.
+- The README's "Running on a microcontroller" section says what the
+  registry shows: all six modules at every tier, because the tier check
+  admits a module that allocates.  The section's claim, that three
+  modules allocate nothing, is unchanged.
+- The example carries the interface stamp beside it.
+- The probe command in the README was run against this release on
+  2026-10-06.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md).

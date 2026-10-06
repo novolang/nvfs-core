@@ -1,6 +1,6 @@
 [package]
 name        = "nvfs-core"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "A littlefs-class filesystem with no device attached: the superblock, the metadata pairs and their commit-and-seal cycle, the CTZ skip-list, the directory entries, and every operation from mount to fsck as a state machine that ANSWERS the block reads and writes a host must perform.  littlefs's four lfs_config callbacks turned into a value, so the format is exercised against a byte array and a power cut is a test that stops feeding answers.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -46,12 +46,9 @@ novo        = ">= 0.8.9"
 # The three modules that ARE — `nvfsgeo`, `nvfsctz`, `nvfswear` — name
 # nothing outside the language.
 #
-# NOT heapless-nv, and the absence is the design rather than an
-# omission.  The device half of this package is integers in the
-# caller's own stack frame; the buffers a firmware needs — the block
-# image it reads into, the record it builds — are the CALLER's, which
-# is the same rule heapless-nv itself follows.  heapless-nv is the
-# package a firmware pairs this with, and the README says so; a
-# dependency would put its bookkeeping between this machine and a
-# buffer it never owns.
+# No collection package.  The device half of this package is integers
+# in the caller's own stack frame.  The buffers a firmware needs, the
+# block image it reads into and the record it builds, are the caller's,
+# and on a device they are the language's fixed-capacity collections
+# (SPEC section 14.8).
 crc-nv = "^0.1.4"
