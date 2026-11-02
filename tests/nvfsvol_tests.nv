@@ -1,9 +1,6 @@
 // nvfsvol_tests.nv — what a record means: the superblock, the entries,
 // and the fold.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: nvfs-core.nvfsvol.<fn>`.
-//
 // THE FOLD IS THE SUITE.  A directory has no index — its live state is
 // its log folded in order — so the interesting cases are all about
 // order: an entry rewritten, an entry removed and put back, a rename
@@ -18,6 +15,7 @@
 use std.test
 use std.bytes
 use std.list
+use nvfsgeo
 use nvfsmeta
 use nvfsvol
 
@@ -95,10 +93,10 @@ fn test_only_a_same_directory_rename_is_one_this_format_can_commit() [io]
     test.assert(nvfsvol.same_parent("/a/b", "/a/c"))
 
     test.case("two names in different directories")
-    test.assert(nvfsvol.same_parent("/a/b", "/x/c") == false)
+    test.assert(not nvfsvol.same_parent("/a/b", "/x/c"))
 
     test.case("and two at different depths")
-    test.assert(nvfsvol.same_parent("/a/b", "/a/c/d") == false)
+    test.assert(not nvfsvol.same_parent("/a/b", "/a/c/d"))
 
 @test
 fn test_the_three_entry_kinds_hold_three_different_things_in_two_words() [io]
@@ -113,7 +111,7 @@ fn test_the_three_entry_kinds_hold_three_different_things_in_two_words() [io]
     let chained = nvfsvol.chain_entry("big", 41, 4096)
     test.assert(chained.word_first == 41)
     test.assert(nvfsvol.entry_size(chained) == 4096)
-    test.assert(nvfsvol.entry_is_directory(chained) == false)
+    test.assert(not nvfsvol.entry_is_directory(chained))
 
     test.case("an inline file's size is the length of what it holds")
     test.assert(nvfsvol.entry_size(nvfsvol.inline_entry("boot", bytes.from_byte_list([1, 2, 3]))) == 3)
@@ -126,10 +124,10 @@ fn test_a_dirent_that_cannot_name_real_blocks_is_caught_before_the_walk() [io]
     test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 5), 32))
 
     test.case("a pair whose two blocks are the same is not a pair")
-    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 4), 32) == false)
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 4), 32))
 
     test.case("a pair past the end of the device")
-    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 99), 32) == false)
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 99), 32))
 
 @test
 fn test_an_entry_round_trips_through_its_record_payload() [io]
@@ -170,7 +168,7 @@ fn test_a_superblock_round_trips_and_refuses_what_it_should() [io]
     test.case("but not a device with different blocks")
     match nvfsvol.decode_superblock(nvfsvol.encode_superblock(g, nvfsvol.default_config()))
         Err(_) => test.assert(false)
-        Ok(sb) => test.assert(nvfsvol.geometry_matches(sb, nvfsvol.geometry(16, 16, 4096, 32)) == false)
+        Ok(sb) => test.assert(not nvfsvol.geometry_matches(sb, nvfsvol.geometry(16, 16, 4096, 32)))
 
     test.case("a payload with the wrong magic is refused as corrupt")
     match nvfsvol.decode_superblock(bytes.zeros(32))
@@ -229,13 +227,13 @@ fn test_a_name_is_checked_against_the_superblocks_bound_not_the_running_one() [i
     test.assert(nvfsvol.name_is_valid("boot", 64))
 
     test.case("an empty one is not a name")
-    test.assert(nvfsvol.name_is_valid("", 64) == false)
+    test.assert(not nvfsvol.name_is_valid("", 64))
 
     test.case("one holding a separator is not a name either")
-    test.assert(nvfsvol.name_is_valid("a/b", 64) == false)
+    test.assert(not nvfsvol.name_is_valid("a/b", 64))
 
     test.case("and one past the bound is refused")
-    test.assert(nvfsvol.name_is_valid("abcdef", 4) == false)
+    test.assert(not nvfsvol.name_is_valid("abcdef", 4))
 
 @test
 fn test_a_configuration_is_refused_with_the_reason_it_was_refused_for() [io]
@@ -268,3 +266,129 @@ fn test_a_configuration_is_refused_with_the_reason_it_was_refused_for() [io]
     test.assert(g.prog_size == 16)
     test.assert(g.block_size == 512)
     test.assert(g.block_count == 32)
+
+    test.case("an inline bound no record could hold is refused")
+    // The bound is where an inline file lives, so a configuration
+    // asking for more than a record's payload describes a write no
+    // block of the device can complete.
+    let fat = nvfsvol.config(100, 255, 4096, nvfsgeo.max_payload(512, 16) + 1)
+    match nvfsvol.check_config(fat, g)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("a file bound below one byte is refused")
+    let nothing = nvfsvol.config(100, 255, 0, 64)
+    match nvfsvol.check_config(nothing, g)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+    test.case("and a geometry the layout arithmetic cannot use is refused by this call too")
+    // The same predicate `nvfsgeo.check_geometry` answers, reached
+    // through the configuration check so a caller asking about a
+    // configuration hears about the device it was asked about.
+    let broken = nvfsvol.geometry(16, 16, 500, 32)
+    match nvfsvol.check_config(nvfsvol.default_config(), broken)
+        NvfsInvalidConfig => test.assert(true)
+        _                 => test.assert(false)
+
+@test
+fn test_the_fold_keeps_the_names_it_does_not_touch_where_they_were() [io]
+    // The arms that COPY an entry through: a put, a remove or a rename
+    // that lands among names it does not mention.  That is the ordinary
+    // case for a growing log, and an arm that dropped them would answer
+    // a directory holding only the name the last record mentioned.
+    let a = nvfsvol.inline_entry("a", bytes.from_byte_list([1]))
+    let b = nvfsvol.inline_entry("b", bytes.from_byte_list([2]))
+
+    test.case("a put for a name that is already there leaves the others where they are")
+    let a2 = nvfsvol.inline_entry("a", bytes.from_byte_list([9]))
+    let put = nvfsvol.fold([entry_record(a), entry_record(b), entry_record(a2)])
+    test.assert(list.len(put) == 2)
+    test.assert(list.get(put, 0, a).name == "a")
+    test.assert(list.get(put, 1, a).name == "b")
+    test.assert(nvfsvol.entry_size(list.get(put, 0, a)) == 1)
+
+    test.case("a tombstone for one name leaves the other")
+    let removed = nvfsvol.fold([entry_record(a), entry_record(b), tombstone_record("a")])
+    test.assert(list.len(removed) == 1)
+    test.assert(list.get(removed, 0, a).name == "b")
+
+    test.case("and a rename leaves the names it did not move")
+    let moved = nvfsvol.fold([entry_record(a), entry_record(b), rename_record("a", "c")])
+    test.assert(list.len(moved) == 2)
+    test.assert(list.get(moved, 0, a).name == "c")
+    test.assert(list.get(moved, 1, a).name == "b")
+
+    test.case("a rename payload whose lengths overrun the bytes it holds moves nothing")
+    // The payload passed its CRC, so this is not damage: it is a record
+    // that is not a rename, and the fold answers the directory it was
+    // given rather than slicing off the end of the buffer.
+    let overrun = nvfsmeta.record(nvfsvol.record_type_rename(),
+                                  bytes.from_byte_list([2, 97, 98, 5, 120]))
+    let kept = nvfsvol.fold([entry_record(a), entry_record(b), overrun])
+    test.assert(list.len(kept) == 2)
+    test.assert(list.get(kept, 0, a).name == "a")
+    test.assert(list.get(kept, 1, a).name == "b")
+
+@test
+fn test_a_payload_that_is_not_an_entry_is_answered_rather_than_guessed_at() [io]
+    test.case("a payload too short to hold the kind and the name length")
+    match nvfsvol.decode_entry(bytes.zeros(1))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("one holding those but not the name length's worth of name")
+    match nvfsvol.decode_entry(bytes.zeros(2))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("and one whose kind byte is not a kind")
+    // The kind byte is the first byte of a payload an image chose, so a
+    // kind that does not exist is reachable input: it is refused rather
+    // than folded into an entry the walk would then act on.
+    let unknown = bytes.from_byte_list([9, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    match nvfsvol.decode_entry(unknown)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("while the three kinds this format has do decode")
+    match nvfsvol.decode_entry(nvfsvol.encode_entry(nvfsvol.inline_entry("a", bytes.zeros(0))))
+        None    => test.assert(false)
+        Some(e) => test.assert(e.name == "a")
+
+@test
+fn test_a_superblock_payload_is_refused_before_any_field_of_it_is_believed() [io]
+    // Both refusals are answered from the payload alone, and both are
+    // reached by a RECORD that passed its CRC: a bit flip in a payload
+    // is damage the checksum catches, while a truncated record and a
+    // record from a newer version are two things a reader has to refuse
+    // by what the bytes say.
+    let g = nvfsvol.geometry(16, 16, 512, 32)
+    let c = nvfsvol.default_config()
+
+    test.case("a payload shorter than the record the format writes is Corrupt")
+    match nvfsvol.decode_superblock(bytes.zeros(16))
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                NvfsCorrupt => test.assert(true)
+                _           => test.assert(false)
+
+    test.case("and one from a major version this reader does not know is refused by version")
+    // A future version is not damage: the payload is whole and the
+    // magic is this format's, and the answer says which of the two it
+    // is so a boot sequence can tell "upgrade the reader" from "the
+    // image is broken".
+    var future = nvfsvol.encode_superblock(g, c)
+    bytes.set_u32_le(future, 4, nvfsgeo.format_version() + 65536)
+    match nvfsvol.decode_superblock(future)
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            match e
+                NvfsVersionUnsupported => test.assert(true)
+                _                      => test.assert(false)
+
+    test.case("while the version this library writes is one it reads")
+    match nvfsvol.decode_superblock(nvfsvol.encode_superblock(g, c))
+        Err(_) => test.assert(false)
+        Ok(sb) => test.assert(sb.block_size == 512)

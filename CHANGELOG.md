@@ -5,6 +5,186 @@ All notable changes to nvfs-core are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Changed
+
+- Internal: ladders rewritten as match. The operation phases, the metadata-pair dispatch and the volume checks read as one match on the phase or the code. No signature, constant or behaviour changed.
+
+## 0.1.0 — 2026-10-12
+
+The bodies.  Every `todo()` in the six modules is implemented, the eight
+suites under `tests/` pass (100 tests), and the package's first working
+release is published over the interface release: no signature changed and no
+effect row was added, removed or narrowed.
+
+### Added
+
+- `nvfsop.begin_next(m, op)` — begin another operation on a machine that has
+  already finished one, keeping its volume, its handle table and its action
+  count.  **The interface had a gap.**  A handle is a number the MACHINE
+  remembers and nothing on disk, and `begin_on` builds a fresh machine, so
+  with only `begin` and `begin_on` a handle could never be used twice: every
+  `NvfsReadFile`, `NvfsWrite`, `NvfsSeek` and `NvfsTruncate` answered
+  `NvfsNotFound` on every reachable call, and the handle `NvfsOpen` answers
+  was decorative.  A consumer that opens a file and then reads it needs
+  exactly this call, which is why it is here rather than a table that lives
+  in a test.
+
+- `tests/nvfsop_ops_tests.nv` — the whole operation surface driven through
+  `begin`/`begin_next` on a RAM device that counts what it was asked: 18
+  tests over the directory operations, the handle table with more than one
+  handle in it, the commit that has to compact and the one that cannot, a
+  check over a damaged image, and the refusals a damaged image reaches (a
+  root pair that is neither sealed nor blank, a superblock record whose
+  payload does not decode, a directory whose pair was erased, a handle that
+  outlives its file, and a chain larger than the volume allows).  Its device
+  answers a short block on request and refuses a program into a byte that
+  was not erased, so the two failures a real part produces — an erase that
+  does not take, and a read shorter than the block it named — are reachable
+  rather than described.
+- The suites that were already here gained the cases the coverage run showed
+  missing, one module at a time: `nvfsvol` the superblock payload refused by
+  length and by version, the fold's arms that copy an entry through, and a
+  payload that is not an entry; `nvfsmeta` the second block winning when its
+  sealed revision is the higher one, in both orders; `nvfswear` a cursor
+  that cannot be a block and an allocation over a device with nothing to
+  allocate; `nvfsctz`, `nvfsgeo` and `nvfswear` their arithmetic's unusable
+  inputs — a zero capacity, a negative offset, a shift past what an `Int`
+  holds, a fifth magic byte, an alignment of zero — each answered rather
+  than divided by.
+
+### Changed
+
+- `NvfsMachine` is widened: every field a step moves is `var` (so a resume
+  advances the machine it was handed instead of rebuilding a literal per
+  step), and the fields past `volume` hold what no signature carries — the
+  first block's scan while a pair is arbitrated, the record being committed,
+  the staged image, the handle table, where a chain read stops, the erase
+  attempts in flight, and the two tallies a check's report carries.  The
+  reason the walk is three `Int`s rather than an `NvfsCtzWalk` is a rule and
+  not a preference: a `@value` struct may not be a boxed struct's field
+  (SPEC § 14.3).
+- A handle-based operation now refuses a handle the machine never issued
+  BEFORE the walk that would resolve its path, which is the same
+  refuse-before-use the two device operations already had.
+- The resume family dispatches on a new predicate, `action_is_ack`, rather
+  than on `action_is_write`: a `NvfsSync` changes nothing and still needs an
+  acknowledgement, and answering a sync with `resume_read` is now
+  `NvfsCorrupt` rather than a silent mis-step.
+- An erase that failed is asked for again, up to `nvfswear.allocation_attempts`
+  times (an erase is idempotent, and this is the bounded retry the
+  `resume_ok` doc now describes); a program or a sync that failed is
+  `NvfsIoFailed` with no retry, because a half-written page must not be
+  written twice.
+- `novo.lint`'s `redundant-bool` rule rewritten at all 56 sites in the
+  suites, every one of them pre-existing (`x == false` → `not x`, which the
+  linter itself suggests and which cannot change a predicate).  No `src/`
+  file had one.
+- Two wrong expected values, both fixtures that contradicted every other
+  statement around them, are corrected rather than worked around:
+  `tests/nvfsgeo_tests.nv` asserted `record_span(8, 8) == 8` where
+  `record_size(8)` is 16 and `record_span` is `align_up` over it, and the
+  device probe compared its own count against 27 where `score` counts 28
+  checks.  In both cases the code that disagreed with the number is the code
+  every neighbouring case agrees with.
+- The suites, the README and `novo.toml` no longer claim the package is an
+  interface release: the `**Status: NOT IMPLEMENTED**` block, the
+  implementation-status table and the "every body is a `todo()`" sentence in
+  each module are gone, and nothing replaced the first two.
+- `novo.toml`: version `0.1.0`, `stability = "experimental"`, and the `novo`
+  floor raised to `>= 0.20.2`, the version every result below was measured
+  against.
+- **The device claim now covers the whole package.**  Every function of
+  `nvfsmeta`, `nvfsvol` and `nvfsop` carries `@tier(app)`: a device build
+  compiles every module under `src/` and checks an unannotated function as
+  device code, fail-closed, so without the annotation those three modules
+  refuse with `E4000` at the first list, boxed struct or `str` call.  With
+  it, `novo build --target=nrf52-qemu` on `tests/embedded_probe.nv` staged
+  under `src/` compiles all six modules and `crc-nv` for a Cortex-M4, and
+  the three modules that allocate are emitted in no image because the probe
+  never reaches them.
+- **`novo.lock` re-resolved `crc-nv` 0.1.4 → 0.1.6**, inside the range the
+  manifest already declared (`^0.1.4`).  0.1.4 is the version that cannot be
+  compiled for a device: its tables are built at run time and its update
+  takes `Bytes`, so every function of it trips `E4000` in a device build, a
+  program that depends on this one included.  0.1.6 is that release's fix
+  (`bugs/orbit/closed/crc-nv-does-not-build-for-a-device.md`, `fixed_in:
+  crc-nv 0.1.6`) and answers the same numbers, which is what
+  `nvfsmeta.record_crc`'s published check value and the CRC cases in
+  `tests/nvfsmeta_tests.nv` and `tests/nvfs_core_edge_tests.nv` assert.
+- **A write at a cursor inside a file keeps the tail it did not reach.**
+  `nvfsop.write_inline` built the new contents as the prefix before the
+  cursor plus the bytes written, and dropped everything after them: a write
+  at a cursor inside a file truncated it to the cursor plus the write,
+  losing bytes the caller never wrote over, which is the opposite of what
+  "write at its cursor" and the function's own comment say.  It now writes
+  the prefix, the gap (a write past the end still leaves zeros), the bytes,
+  and the tail, and `tests/nvfsop_ops_tests.nv` pins the tail.
+- **An operation re-seeds its pair to the constant root pair.**
+  `nvfsop.reset_op` cleared the walk's numbers and left `m.pair` where the
+  last walk arrived — inside a subdirectory, most often — so an operation
+  begun on a machine that had just walked into a directory resolved its path
+  against THAT directory's log: `NvfsReadDir("/sub")` on a machine whose
+  previous operation ended in `/sub` walked from `/sub`'s pair, looked for
+  a name `sub` in `/sub`, and answered `NvfsNotFound` for a directory that
+  was there.  The seed is the constant root pair rather than the pair the
+  walk last saw, which is also correct after a compaction has flipped the
+  two blocks' physical order: `arbitrate` re-derives the active block from
+  the sealed revision, never from the order the pair was named in.
+
+### Known
+
+- **Not supported, and each one is named in the code that refuses it:**
+  `NvfsMkdir` (a new pair's commit plus the parent's dirent are two pair
+  slots this machine has one of), removing a directory (its tombstone would
+  orphan whatever its pair holds), removing the root (there is no parent log
+  to tombstone in), a rename across directories or of the root, growing a
+  chain file, and truncating one.  Each needs the same missing piece — a
+  walk that decides which blocks nothing reaches — and each answers
+  `NvfsNotSupported` rather than doing half the job.  Files that live inline
+  are created, written, read, seeked and truncated.
+- **The handle table is the machine's.**  A driver that drops a machine drops
+  its handles; `begin_next` keeps them across operations on one machine and
+  nothing keeps them across processes, because nothing about a handle is on
+  disk.
+- **Free space is "entirely erased".**  A check's `blocks_used` counts every
+  block that holds anything at all, which is the definition that never hands
+  a live block to an allocator, and it is coarser than "reachable from the
+  root" — the same walk the refusals above are missing.
+- **A record's padding is invisible to a scan**, by design: the next record
+  is reached by alignment, so a bit flipped in the erased bytes between two
+  records is not damage and is not reported.
+- **The device claim is about a compile, not about behaviour on a part.**
+  `tests/embedded_probe.nv` builds for `nrf52-qemu` twice — where it sits,
+  and staged under `src/` so that the dependencies are in the compilation
+  too — and is not run in either form: what it proves is a property of the
+  surface, that nothing in the closure it calls needs an allocator or an
+  operating system.  Nothing here has been executed on a Cortex-M, and no
+  read, program or erase has been timed on one.
+- **`@tier(app)` is a promise the compiler takes at its word.**  It is what
+  makes a device build accept the three host-face modules, and it is also
+  what stops those modules from being checked: a function that allocates
+  where the annotation says it may is not reported.  The narrower claim —
+  that `nvfsgeo`, `nvfsctz` and `nvfswear` allocate nothing — is the one a
+  device build checks on its own, because those three carry no annotation at
+  all.
+- **No path cache**, so every operation walks from the root, which is what
+  the interface's "a handle is not a cache" prose already said.
+- **21 arms are excused as unreachable, and each one says why at the site.**
+  `novo pkg publish --dry-run` measures 97% of 999 instrumented lines under
+  `src/` covered, with 21 regions excused by `cov: skip`; every one of them
+  is in `nvfsop`, and every one is a `None` or negative arm that an
+  invariant established a few lines earlier keeps out of reach — the
+  per-operation phase maps' `else` arms, `first_scan` before a pair's second
+  read, `name_bound` before a mount, the two operations `act` cannot see,
+  the three `pos < 0` arms behind `handle_start`'s check, the chain walk's
+  index being at or above its target by construction, and `clamp`'s callers
+  having already refused a negative value.  They are kept rather than
+  deleted because each is the refusal that a phase added later or a
+  re-ordered check would need, and deleting a guard to raise a percentage is
+  the wrong trade.  The other five modules are covered without excuse.
+
 ## 0.0.3 — 2026-10-06
 
 README and comments only.  No signature, type or effect row changed, and

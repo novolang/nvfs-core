@@ -1,0 +1,1437 @@
+// nvfsop_ops_tests.nv — the whole operation surface, driven on a
+// device that counts what it was asked.
+//
+// `nvfsop_tests.nv` argues for the action-as-a-value shape and
+// `nvfs_core_edge_tests.nv` pins the four claims the format rests on.
+// What neither of them does is RUN the operations: a stat of a name
+// that is there, a write at a cursor inside the file, a rename onto a
+// name that exists, a commit that no longer fits and has to compact, a
+// check that walks a volume whose log has been damaged.  Every one of
+// those is an arm of `nvfsop` that only a caller reaches, and an arm
+// nothing calls is an arm nothing checks.
+//
+// THE DEVICE IS THE EDGE SUITE'S, with three knobs added.  It counts
+// the reads and programs whose range was outside it, refuses a program
+// into a byte that was not erased — NOR's own rule — and answers a
+// short block for one block number on request.  The knobs are what let
+// a test ask for the two failures a real part actually produces: an
+// erase that does not take the first time (the retry), and a read that
+// comes back smaller than the block it named (the short-read guard).
+//
+// THE FILES ARE INLINE, on purpose.  A chain file is refused for a
+// write and a truncation and this suite pins that refusal; the chain
+// READ is `nvfs_core_edge_tests.nv`'s.  What is left here is the
+// operation surface a caller uses every day, driven through
+// `begin`/`begin_next` so that the handles `NvfsOpen` answers are the
+// machine's own across a whole session rather than one operation.
+
+use std.test
+use std.bytes
+use std.list
+use nvfsctz
+use nvfsgeo
+use nvfsmeta
+use nvfsop
+use nvfsvol
+use nvfswear
+
+fn small_geometry() -> nvfsvol.NvfsGeometry
+    nvfsvol.geometry(16, 16, 512, 32)
+
+fn seeded() -> nvfsvol.NvfsConfig
+    nvfsvol.default_config()
+
+fn erased(n: Int) -> Bytes
+    bytes.from_byte_list(list.range(0, n) |> list.map(_ => nvfsgeo.erased_byte()))
+
+// A name of `n` bytes, for the cases that ask what happens past the
+// bound.  Built rather than written out, so the case says WHICH bound
+// it is testing against rather than counting characters.
+fn long_name(n: Int) -> Str
+    var s = ""
+    var i = 0
+    while i < n
+        s = s + "x"
+        i = i + 1
+    s
+
+// ---------------------------------------------------------------------------
+// A device, and the host that performs its actions.
+// ---------------------------------------------------------------------------
+
+struct Ram
+    geometry: nvfsvol.NvfsGeometry
+    var data: Bytes
+    var reads: Int
+    var oob_reads: Int
+    var progs: Int
+    var oob_progs: Int
+    var erases: Int
+    var programmed_twice: Int
+    // How many erases and programs the host refuses before it answers
+    // ok, and which block a read answers short.  The three ways this
+    // package's retry and short-read guards are reached.
+    var fail_erases: Int
+    var fail_progs: Int
+    var short_block: Int
+
+fn ram(g: nvfsvol.NvfsGeometry) -> Ram
+    Ram { geometry: g, data: erased(g.block_size * g.block_count), reads: 0,
+          oob_reads: 0, progs: 0, oob_progs: 0, erases: 0, programmed_twice: 0,
+          fail_erases: 0, fail_progs: 0, short_block: 0 - 1 }
+
+// Where a block starts, as a byte offset.  The one conversion this
+// package is about, and it is spelled once.
+fn block_at(d: Ram, block: Int) -> Int
+    block * d.geometry.block_size
+
+fn within(d: Ram, at: Int, len: Int) -> Bool
+    at >= 0 and len >= 0 and at + len <= bytes.len(d.data)
+
+// A factory image: bytes written into a block directly, because a
+// caller holding an image is not a device programming it.
+fn install(var d: Ram, block: Int, image: Bytes)
+    let at = block_at(d, block)
+    if within(d, at, bytes.len(image))
+        bytes.copy_into(d.data, at, image, 0, bytes.len(image))
+
+fn all_erased(d: Ram, at: Int, len: Int) -> Bool
+    var clean = true
+    var i = 0
+    while i < len
+        if (bytes.byte_at(d.data, at + i) ?? 0) != nvfsgeo.erased_byte()
+            clean = false
+        i = i + 1
+    clean
+
+// littlefs's four callbacks, over the byte array.
+fn perform(var d: Ram, a: nvfsop.NvfsAction) -> nvfsop.NvfsAnswer
+    match a
+        NvfsRead(block, off, len)     =>
+            d.reads = d.reads + 1
+            let at = block_at(d, block)
+            if block < 0 or block >= d.geometry.block_count
+                or not within(d, at + off, len)
+                d.oob_reads = d.oob_reads + 1
+                NvfsGotBytes(bytes.zeros(0))
+            elif block == d.short_block
+                // The read was answered, and answered with less than
+                // the block: a host that truncated its own buffer.
+                NvfsGotBytes(bytes.slice(d.data, at + off, at + off + len / 2))
+            else
+                NvfsGotBytes(bytes.slice(d.data, at + off, at + off + len))
+        NvfsProg(block, off, payload) =>
+            d.progs = d.progs + 1
+            let at = block_at(d, block)
+            if d.fail_progs > 0
+                d.fail_progs = d.fail_progs - 1
+                NvfsGotOk(false)
+            elif block < 0 or block >= d.geometry.block_count
+                or not within(d, at + off, bytes.len(payload))
+                d.oob_progs = d.oob_progs + 1
+                NvfsGotOk(false)
+            elif not all_erased(d, at + off, bytes.len(payload))
+                d.programmed_twice = d.programmed_twice + 1
+                NvfsGotOk(false)
+            else
+                bytes.copy_into(d.data, at + off, payload, 0, bytes.len(payload))
+                NvfsGotOk(true)
+        NvfsErase(block)              =>
+            d.erases = d.erases + 1
+            if d.fail_erases > 0
+                d.fail_erases = d.fail_erases - 1
+                NvfsGotOk(false)
+            elif block < 0 or block >= d.geometry.block_count
+                d.oob_progs = d.oob_progs + 1
+                NvfsGotOk(false)
+            else
+                bytes.fill(d.data, block_at(d, block), d.geometry.block_size,
+                           nvfsgeo.erased_byte())
+                NvfsGotOk(true)
+        NvfsSync                      => NvfsGotOk(true)
+
+fn drive(var d: Ram, start: nvfsop.NvfsProgress, budget: Int) -> nvfsop.NvfsProgress
+    var p = start
+    var steps = 0
+    var running = true
+    while running and steps < budget
+        match p.step
+            NvfsNeed(a)   =>
+                p = nvfsop.resume(p.machine, perform(d, a))
+            NvfsDone(_)   =>
+                running = false
+            NvfsFailed(_) =>
+                running = false
+        steps = steps + 1
+    p
+
+// The next operation on a machine that has finished one, which is the
+// call that keeps the handle table and the volume.
+fn next(var d: Ram, m: nvfsop.NvfsMachine, op: nvfsop.NvfsOp, budget: Int) -> nvfsop.NvfsProgress
+    drive(d, nvfsop.begin_next(m, op), budget)
+
+fn is_done(p: nvfsop.NvfsProgress) -> Bool
+    match p.step
+        NvfsDone(_) => true
+        _           => false
+
+fn failed_with(p: nvfsop.NvfsProgress, e: nvfsgeo.NvfsError) -> Bool
+    match p.step
+        NvfsFailed(got) => nvfsgeo.error_name(got) == nvfsgeo.error_name(e)
+        _               => false
+
+fn completed(p: nvfsop.NvfsProgress) -> Bool
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsCompleted => true
+                _             => false
+        _           => false
+
+fn data_of(p: nvfsop.NvfsProgress) -> Bytes
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsData(d) => bytes.clone(d)
+                _           => bytes.zeros(0)
+        _           => bytes.zeros(0)
+
+fn handle_of(p: nvfsop.NvfsProgress) -> Int
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsHandle(h) => h
+                _             => 0 - 1
+        _           => 0 - 1
+
+fn position_of(p: nvfsop.NvfsProgress) -> Int
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsPosition(off) => off
+                _                 => 0 - 1000
+        _           => 0 - 1000
+
+fn written_of(p: nvfsop.NvfsProgress) -> Int
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsWritten(n) => n
+                _              => 0 - 1000
+        _           => 0 - 1000
+
+fn entries_of(p: nvfsop.NvfsProgress) -> [nvfsvol.NvfsEntry]
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsEntries(es) => es[:]
+                _               => []
+        _           => []
+
+fn statted_of(p: nvfsop.NvfsProgress) -> nvfsvol.NvfsEntry
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsStatted(e) => e
+                _              => nvfsvol.inline_entry("", bytes.zeros(0))
+        _           => nvfsvol.inline_entry("", bytes.zeros(0))
+
+fn report_of(p: nvfsop.NvfsProgress) -> nvfsop.NvfsReport
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsChecked(rep) => rep
+                _                => nvfsop.empty_report()
+        _           => nvfsop.empty_report()
+
+fn named(entries: [nvfsvol.NvfsEntry], i: Int) -> Str
+    list.get(entries, i, nvfsvol.inline_entry("", bytes.zeros(0))).name
+
+// A byte of an answer, and -1 for a byte that is not there.
+fn byte_of(b: Bytes, i: Int) -> Int
+    bytes.byte_at(b, i) ?? 0 - 1
+
+// ---------------------------------------------------------------------------
+// Images, built by hand.
+// ---------------------------------------------------------------------------
+
+fn meta_block(records: [nvfsmeta.NvfsRecord], prog: Int, block_size: Int, revision: Int) -> Bytes
+    let seal = nvfsmeta.seal_image(revision, prog)
+    let image = nvfsmeta.compaction_image(records, prog)
+    let used = bytes.len(seal) + bytes.len(image)
+    if used >= block_size
+        seal + image
+    else
+        seal + image + erased(block_size - used)
+
+fn superblock_of(device: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_superblock(), nvfsvol.encode_superblock(device, c))
+
+fn entry_record(e: nvfsvol.NvfsEntry) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_entry(), nvfsvol.encode_entry(e))
+
+// A superblock in a superblock record, which is the only thing the root
+// pair has that no other pair does.
+fn volume_of(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, revision: Int) -> nvfsvol.NvfsVolume
+    nvfsvol.volume(g, nvfsvol.superblock(nvfsgeo.format_version(), g.block_size,
+                                         g.block_count, c.name_max, c.inline_max,
+                                         c.file_max, c.block_cycles),
+                                         revision, 0)
+
+// A formatted device, which is where every case below starts.
+fn formatted(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig) -> Ram
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    d
+
+// ---------------------------------------------------------------------------
+// The directory operations.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_the_directory_operations_over_one_volume() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    test.case("a stat of the root answers the root, and not a missing name")
+    let st = next(d, m, NvfsStat("/"), 400)
+    test.assert(is_done(st))
+    test.assert(nvfsvol.entry_is_directory(statted_of(st)))
+    test.assert(statted_of(st).name == "")
+    m = st.machine
+
+    test.case("a stat of a name that is not there is NotFound")
+    let miss = next(d, m, NvfsStat("/nope"), 400)
+    test.assert(failed_with(miss, NvfsNotFound))
+    m = miss.machine
+
+    test.case("a listing of the root is empty, and is an answer rather than a failure")
+    let ls = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(is_done(ls))
+    test.assert(list.len(entries_of(ls)) == 0)
+    m = ls.machine
+
+    test.case("a mkdir is refused by name: a new directory needs a pair of its own")
+    let mk = next(d, m, NvfsMkdir("/logs"), 400)
+    test.assert(failed_with(mk, NvfsNotSupported))
+    m = mk.machine
+
+    test.case("the root is not a name a directory can take — it is already one")
+    let mkr = next(d, m, NvfsMkdir("/"), 400)
+    test.assert(failed_with(mkr, NvfsExists))
+    m = mkr.machine
+
+    test.case("nor is a name past the bound")
+    let mkl = next(d, m, NvfsMkdir("/" + long_name(300)), 400)
+    test.assert(failed_with(mkl, NvfsNameTooLong))
+    m = mkl.machine
+
+    test.case("the root cannot be removed: there is no parent log to tombstone in")
+    let rm = next(d, m, NvfsRemove("/"), 400)
+    test.assert(failed_with(rm, NvfsNotSupported))
+    m = rm.machine
+
+    test.case("and a name that is not there removes nothing")
+    let rmn = next(d, m, NvfsRemove("/nope"), 400)
+    test.assert(failed_with(rmn, NvfsNotFound))
+    m = rmn.machine
+
+    test.case("an open that may not create answers NotFound for a missing file")
+    let ob = next(d, m, NvfsOpen("/f", false), 400)
+    test.assert(failed_with(ob, NvfsNotFound))
+    m = ob.machine
+
+    test.case("an open that may create writes one record and answers a handle")
+    let oc = next(d, m, NvfsOpen("/f", true), 400)
+    test.assert(is_done(oc))
+    let h = handle_of(oc)
+    test.assert(h >= 0)
+    m = oc.machine
+
+    test.case("the entry is on disk now, empty and not a directory")
+    let st2 = next(d, m, NvfsStat("/f"), 400)
+    test.assert(is_done(st2))
+    test.assert(statted_of(st2).name == "f")
+    test.assert(not nvfsvol.entry_is_directory(statted_of(st2)))
+    test.assert(nvfsvol.entry_size(statted_of(st2)) == 0)
+    m = st2.machine
+
+    test.case("the root lists it, by the name it was created with")
+    let ls2 = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(list.len(entries_of(ls2)) == 1)
+    test.assert(named(entries_of(ls2), 0) == "f")
+    m = ls2.machine
+
+    test.case("naming an entry that is there REOPENS it and answers a second handle")
+    let o2 = next(d, m, NvfsOpen("/f", false), 400)
+    test.assert(is_done(o2))
+    test.assert(handle_of(o2) != h)
+    m = o2.machine
+
+    test.case("a rename to the name it already has is done, and Exists would read as a failure")
+    let rn = next(d, m, NvfsRename("/f", "/f"), 400)
+    test.assert(completed(rn))
+    m = rn.machine
+
+    test.case("a rename into another directory is refused: two pairs, one commit")
+    let rc = next(d, m, NvfsRename("/f", "/sub/f"), 400)
+    test.assert(failed_with(rc, NvfsNotSupported))
+    m = rc.machine
+
+    test.case("a rename of the root has no log to move a record in")
+    let rr = next(d, m, NvfsRename("/", "/x"), 400)
+    test.assert(failed_with(rr, NvfsNotSupported))
+    m = rr.machine
+
+    test.case("a rename of a name that is not there is NotFound")
+    let rn2 = next(d, m, NvfsRename("/nope", "/z"), 400)
+    test.assert(failed_with(rn2, NvfsNotFound))
+    m = rn2.machine
+
+    test.case("a rename onto a name that is there is Exists")
+    let og = next(d, m, NvfsOpen("/g", true), 400)
+    test.assert(is_done(og))
+    m = og.machine
+    let rx = next(d, m, NvfsRename("/f", "/g"), 400)
+    test.assert(failed_with(rx, NvfsExists))
+    m = rx.machine
+
+    test.case("and a target past the name bound is refused before the log is touched")
+    let rl = next(d, m, NvfsRename("/f", "/" + long_name(300)), 400)
+    test.assert(failed_with(rl, NvfsNameTooLong))
+    m = rl.machine
+
+    test.case("a rename inside one directory commits one record, and the name moves")
+    let ok = next(d, m, NvfsRename("/f", "/h"), 400)
+    test.assert(completed(ok))
+    m = ok.machine
+    let there = next(d, m, NvfsStat("/h"), 400)
+    test.assert(is_done(there))
+    m = there.machine
+    let gone = next(d, m, NvfsStat("/f"), 400)
+    test.assert(failed_with(gone, NvfsNotFound))
+    m = gone.machine
+
+    test.case("a remove writes one tombstone, and the name is gone from the listing")
+    let rmh = next(d, m, NvfsRemove("/h"), 400)
+    test.assert(completed(rmh))
+    m = rmh.machine
+    let after = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(list.len(entries_of(after)) == 1)
+    test.assert(named(entries_of(after), 0) == "g")
+    m = after.machine
+
+    test.case("and removing it a second time is NotFound, not a second tombstone")
+    let rm2 = next(d, m, NvfsRemove("/h"), 400)
+    test.assert(failed_with(rm2, NvfsNotFound))
+
+    test.case("through all of it, not one program wrote a byte twice")
+    test.assert(d.programmed_twice == 0)
+    test.assert(d.oob_reads == 0)
+    test.assert(d.oob_progs == 0)
+
+// ---------------------------------------------------------------------------
+// The handle operations.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_the_handle_operations_on_one_inline_file() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    let o = next(d, m, NvfsOpen("/f", true), 400)
+    test.assert(is_done(o))
+    let h = handle_of(o)
+    m = o.machine
+
+    test.case("a write at the cursor appends, and the cursor moves by what was written")
+    let w = next(d, m, NvfsWrite(h, bytes.from_str("hello")), 400)
+    test.assert(is_done(w))
+    test.assert(written_of(w) == 5)
+    test.assert(nvfsop.handle_position(w.machine, h) == 5)
+    m = w.machine
+
+    test.case("a read at the end of the file answers no bytes rather than failing")
+    let e = next(d, m, NvfsReadFile(h, 5), 400)
+    test.assert(is_done(e))
+    test.assert(bytes.len(data_of(e)) == 0)
+    m = e.machine
+
+    test.case("a seek from the start moves the cursor, and a read answers the bytes")
+    let s0 = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(position_of(s0) == 0)
+    m = s0.machine
+    let r5 = next(d, m, NvfsReadFile(h, 5), 400)
+    test.assert(bytes.to_str(data_of(r5)) == "hello")
+    test.assert(nvfsop.handle_position(r5.machine, h) == 5)
+    m = r5.machine
+
+    test.case("a read that asks for more than is left is short, and not an error")
+    let s1 = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(is_done(s1))
+    m = s1.machine
+    let r10 = next(d, m, NvfsReadFile(h, 10), 400)
+    test.assert(bytes.len(data_of(r10)) == 5)
+    test.assert(nvfsop.handle_position(r10.machine, h) == 5)
+    m = r10.machine
+
+    test.case("a seek from the end, and one from behind it")
+    let s2 = next(d, m, NvfsSeek(h, 0, 2), 400)
+    test.assert(position_of(s2) == 5)
+    m = s2.machine
+    let s3 = next(d, m, NvfsSeek(h, 0 - 2, 2), 400)
+    test.assert(position_of(s3) == 3)
+    m = s3.machine
+
+    test.case("a target before the start is clamped to the start")
+    let s4 = next(d, m, NvfsSeek(h, 0 - 100, 2), 400)
+    test.assert(position_of(s4) == 0)
+    m = s4.machine
+    let s5 = next(d, m, NvfsSeek(h, 0 - 1, 0), 400)
+    test.assert(position_of(s5) == 0)
+    m = s5.machine
+
+    test.case("a seek from the cursor is arithmetic on where the cursor is")
+    let s6 = next(d, m, NvfsSeek(h, 3, 1), 400)
+    test.assert(position_of(s6) == 3)
+    m = s6.machine
+
+    test.case("and a whence that is none of the three leaves the cursor where it is")
+    let s7 = next(d, m, NvfsSeek(h, 99, 9), 400)
+    test.assert(position_of(s7) == 3)
+    m = s7.machine
+
+    test.case("a write past the end leaves a gap, and a gap is zeros")
+    let s8 = next(d, m, NvfsSeek(h, 10, 0), 400)
+    test.assert(position_of(s8) == 10)
+    m = s8.machine
+    let w2 = next(d, m, NvfsWrite(h, bytes.from_str("z")), 400)
+    test.assert(written_of(w2) == 1)
+    test.assert(nvfsop.handle_position(w2.machine, h) == 11)
+    m = w2.machine
+    let sz = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(is_done(sz))
+    m = sz.machine
+    let all = next(d, m, NvfsReadFile(h, 11), 400)
+    let got = data_of(all)
+    // "hello", five bytes of nothing, then the byte that was written:
+    // the file ends where the WRITE ended, and the hole before it is
+    // zeros rather than the last byte again.
+    test.assert(bytes.len(got) == 11)
+    test.assert(byte_of(got, 0) == 'h')
+    test.assert(byte_of(got, 4) == 'o')
+    test.assert(byte_of(got, 5) == 0)
+    test.assert(byte_of(got, 9) == 0)
+    test.assert(byte_of(got, 10) == 'z')
+    m = all.machine
+
+    test.case("a write at a cursor INSIDE the file replaces what it covers, keeping the tail")
+    let s9 = next(d, m, NvfsSeek(h, 5, 0), 400)
+    test.assert(position_of(s9) == 5)
+    m = s9.machine
+    let w3 = next(d, m, NvfsWrite(h, bytes.from_str("HE")), 400)
+    test.assert(written_of(w3) == 2)
+    test.assert(nvfsop.handle_position(w3.machine, h) == 7)
+    m = w3.machine
+    let s10 = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(is_done(s10))
+    m = s10.machine
+    let r11 = next(d, m, NvfsReadFile(h, 11), 400)
+    let edited = data_of(r11)
+    // "hello" + "HE" + the four bytes the write did not reach.  Two
+    // bytes were written over the hole's first two; a write that
+    // dropped the tail would answer five bytes here.
+    test.assert(bytes.len(edited) == 11)
+    test.assert(byte_of(edited, 4) == 'o')
+    test.assert(byte_of(edited, 5) == 'H')
+    test.assert(byte_of(edited, 6) == 'E')
+    test.assert(byte_of(edited, 7) == 0)
+    test.assert(byte_of(edited, 10) == 'z')
+    m = r11.machine
+
+    test.case("a write that would take an inline file past its bound is NoSpace")
+    let s11 = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(is_done(s11))
+    m = s11.machine
+    let w4 = next(d, m, NvfsWrite(h, bytes.zeros(200)), 400)
+    test.assert(failed_with(w4, NvfsNoSpace))
+    m = w4.machine
+
+    test.case("a truncation shortens the file and pulls a cursor past the end back to it")
+    let s12 = next(d, m, NvfsSeek(h, 10, 0), 400)
+    test.assert(position_of(s12) == 10)
+    m = s12.machine
+    let t1 = next(d, m, NvfsTruncate(h, 3), 400)
+    test.assert(completed(t1))
+    test.assert(nvfsop.handle_position(t1.machine, h) == 3)
+    m = t1.machine
+    let at3 = next(d, m, NvfsReadFile(h, 4), 400)
+    test.assert(bytes.len(data_of(at3)) == 0)
+    m = at3.machine
+
+    test.case("and a truncation LENGTHENS one past its end, with zeros")
+    let t2 = next(d, m, NvfsTruncate(h, 6), 400)
+    test.assert(completed(t2))
+    m = t2.machine
+    let gap = next(d, m, NvfsReadFile(h, 3), 400)
+    let g3 = data_of(gap)
+    test.assert(bytes.len(g3) == 3)
+    test.assert(byte_of(g3, 0) == 0)
+    test.assert(byte_of(g3, 2) == 0)
+    m = gap.machine
+
+    test.case("a negative size is not a size")
+    let t3 = next(d, m, NvfsTruncate(h, 0 - 1), 400)
+    test.assert(failed_with(t3, NvfsInvalidConfig))
+    m = t3.machine
+
+    test.case("nor is one past what an inline record can hold")
+    let t4 = next(d, m, NvfsTruncate(h, 200), 400)
+    test.assert(failed_with(t4, NvfsNoSpace))
+    m = t4.machine
+
+    test.case("a close forgets the handle and writes nothing")
+    test.assert(nvfsop.handle_is_open(m, h))
+    let cl = next(d, m, NvfsClose(h), 400)
+    test.assert(completed(cl))
+    test.assert(not nvfsop.handle_is_open(cl.machine, h))
+    m = cl.machine
+
+    test.case("closing it again is NotFound, and so is reading through it")
+    let cl2 = next(d, m, NvfsClose(h), 400)
+    test.assert(failed_with(cl2, NvfsNotFound))
+    m = cl2.machine
+    let dead = next(d, m, NvfsReadFile(h, 1), 400)
+    test.assert(failed_with(dead, NvfsNotFound))
+
+    test.case("nothing through all of it programmed a byte twice")
+    test.assert(d.programmed_twice == 0)
+
+// ---------------------------------------------------------------------------
+// What the machine refuses before it starts, and how it answers a resume.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_the_machine_refuses_what_it_cannot_run_and_says_why() [io]
+    let g = small_geometry()
+    let c = seeded()
+
+    test.case("a path operation on a device that was never mounted is NotSupported")
+    var d = ram(g)
+    test.assert(failed_with(drive(d, nvfsop.begin(g, c, NvfsStat("/")), 8), NvfsNotSupported))
+
+    test.case("a configuration that does not fit the device is refused by `begin`")
+    let bad = nvfsvol.config(100, 0, 4096, 64)
+    test.assert(failed_with(drive(d, nvfsop.begin(g, bad, NvfsMount), 8), NvfsInvalidConfig))
+
+    test.case("a machine in the middle of an operation refuses a second one")
+    let mid = nvfsop.begin(g, c, NvfsMount)
+    test.assert(failed_with(nvfsop.begin_next(mid.machine, NvfsStat("/")), NvfsInvalidConfig))
+
+    test.case("an acknowledgement for a read is Corrupt, not a silent mis-step")
+    // A FRESH machine, because a machine is a shared box: the case above
+    // handed `mid` to `begin_next`, whose refusal marked that same box
+    // terminal, and a terminal machine wants nothing at all.  This is
+    // the case where the machine still wants a read.
+    let waiting = nvfsop.begin(g, c, NvfsMount)
+    match nvfsop.pending(waiting.machine)
+        None    => test.assert(false)
+        Some(a) => test.assert(not nvfsop.action_is_ack(a))
+    test.assert(failed_with(nvfsop.resume_ok(waiting.machine, true), NvfsCorrupt))
+
+    test.case("an operation on a mounted volume refuses to format or mount again")
+    var e = ram(g)
+    let f = drive(e, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    test.assert(failed_with(nvfsop.begin_next(f.machine, NvfsFormat), NvfsNotSupported))
+    test.assert(failed_with(nvfsop.begin_next(f.machine, NvfsMount), NvfsNotSupported))
+
+    test.case("a finished machine wants nothing, so there is no answer to give it")
+    match nvfsop.pending(f.machine)
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    test.assert(failed_with(nvfsop.resume_read(f.machine, bytes.zeros(0)), NvfsCorrupt))
+    test.assert(failed_with(nvfsop.resume_ok(f.machine, true), NvfsCorrupt))
+
+    test.case("the boot sequence: a part that never held a filesystem, then a format")
+    // `NvfsNoFilesystem` is the error a boot turns on to decide to
+    // format, so the operation a driver runs next is a format on the
+    // machine that just failed — a terminal machine with no volume.
+    var blank = ram(g)
+    let v = drive(blank, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(failed_with(v, NvfsNoFilesystem))
+    let made = drive(blank, nvfsop.begin_next(v.machine, NvfsFormat), 400)
+    test.assert(is_done(made))
+    match nvfsop.volume(made.machine)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+
+    test.case("a sync moves no bytes and still names no block")
+    test.assert(nvfsop.action_length(NvfsSync) == 0)
+    test.assert(nvfsop.action_is_erase(NvfsErase(1)))
+    test.assert(not nvfsop.action_is_erase(NvfsSync))
+
+    test.case("the machine's own actions are held to the geometry it was given")
+    test.assert(nvfsop.action_is_valid(NvfsProg(0, 0, bytes.zeros(16)), g))
+    test.assert(nvfsop.action_is_valid(NvfsSync, g))
+    test.assert(not nvfsop.action_is_valid(NvfsProg(32, 0, bytes.zeros(16)), g))
+
+    test.case("and every path-named operation reports its path")
+    test.assert(nvfsop.op_path(NvfsStat("/a")) == "/a")
+    test.assert(nvfsop.op_path(NvfsMkdir("/logs")) == "/logs")
+    test.assert(nvfsop.op_path(NvfsRemove("/a")) == "/a")
+
+// ---------------------------------------------------------------------------
+// The two failures a part produces: an erase that does not take, and a
+// program that fails.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_an_erase_is_asked_again_and_a_program_is_not() [io]
+    let g = small_geometry()
+    let c = seeded()
+
+    test.case("an erase that fails once is asked again, and the format completes")
+    var d = ram(g)
+    d.fail_erases = 1
+    let p = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(p))
+    // The state: one more erase than the format would have done, and the
+    // same device afterwards as a run that was never refused.
+    var control = ram(g)
+    let q = drive(control, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(q))
+    test.assert(d.erases == control.erases + 1)
+    test.assert(d.programmed_twice == 0)
+    test.assert(control.programmed_twice == 0)
+
+    test.case("a program that fails is IoFailed, with no second attempt")
+    // A half-written page must never be written twice, so the retry
+    // that is right for an erase is wrong here.
+    var e = ram(g)
+    e.fail_progs = 1
+    let r = drive(e, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(failed_with(r, NvfsIoFailed))
+    test.assert(e.progs == 1)
+
+    test.case("and an erase that keeps failing is given up on, not retried forever")
+    var f = ram(g)
+    f.fail_erases = 9
+    let s = drive(f, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(failed_with(s, NvfsIoFailed))
+    test.assert(f.erases == nvfswear.allocation_attempts())
+    test.assert(nvfswear.allocation_attempts() == 3)
+
+// ---------------------------------------------------------------------------
+// A commit that no longer fits: the compaction, and the commit that
+// cannot compact.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_a_commit_the_tail_cannot_hold_compacts_into_the_sibling() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    // Enough commits that the log's tail fills and the next one has to
+    // go through the sibling block.  Each entry record spans a whole
+    // prog page, so a 512-byte block holds about fifteen of them.
+    test.case("filling the log's tail compacts rather than refusing")
+    var i = 0
+    var compacted = 0
+    while i < 14
+        let o = next(d, m, NvfsOpen("/f" + "${i}", true), 400)
+        test.assert(is_done(o))
+        m = o.machine
+        i = i + 1
+    test.assert(d.erases > 2)
+
+    test.case("and every one of them is still there afterwards")
+    let ls = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(is_done(ls))
+    test.assert(list.len(entries_of(ls)) == 14)
+    m = ls.machine
+
+    test.case("the volume still mounts, from whichever block is now the active one")
+    match nvfsop.volume(m)
+        None    => test.assert(false)
+        Some(_) => test.assert(true)
+    var e = ram(g)
+    // The same bytes, on a device the machine did not write: this is
+    // what "the volume is on the part" means.
+    bytes.copy_into(e.data, 0, d.data, 0, bytes.len(d.data))
+    let re = drive(e, nvfsop.begin(g, c, NvfsMount), 400)
+    test.assert(is_done(re))
+    match nvfsop.volume(re.machine)
+        None    => test.assert(false)
+        Some(_) =>
+            let ls2 = drive(e, nvfsop.begin_on(nvfsop.volume(re.machine) ?? volume_of(g, c, 1),
+                                               c, NvfsReadDir("/")),
+                                               400)
+            test.assert(is_done(ls2))
+            test.assert(list.len(entries_of(ls2)) == 14)
+
+    test.case("not one program wrote a byte twice, across every compaction")
+    test.assert(d.programmed_twice == 0)
+    test.assert(d.oob_reads == 0)
+
+@test
+fn test_a_commit_that_cannot_compact_is_NoSpace_rather_than_a_lost_entry() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    // Past a certain number of live entries the COMPACTED form no
+    // longer fits in the block either, which is the point at which a
+    // filesystem has to say no: the record set that would have to be
+    // preserved is larger than the block that must hold it.
+    var i = 0
+    var refused = false
+    while i < 40 and not refused
+        let o = next(d, m, NvfsOpen("/f" + "${i}", true), 400)
+        if failed_with(o, NvfsNoSpace)
+            refused = true
+        i = i + 1
+    test.assert(refused)
+
+    test.case("and the volume is still readable, with the entries that did land")
+    test.assert(d.programmed_twice == 0)
+
+// ---------------------------------------------------------------------------
+// What a check reports.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_a_check_counts_the_entries_and_names_what_is_wrong_with_them() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let root = superblock_of(g, c)
+    // Three entries, and all three are complaints:
+    //   * a directory whose pair is past the end of the device,
+    //   * a file larger than the volume's own bound,
+    //   * a chain whose head is not a block of this device.
+    let outside = entry_record(nvfsvol.directory_entry("sub", 40, 41))
+    let big = entry_record(nvfsvol.inline_entry("big", bytes.from_byte_list(
+        [1, 2, 3, 4, 5, 6, 7, 8])))
+    let far = entry_record(nvfsvol.chain_entry("chain", 99, 4))
+    // And a fourth block carrying a record of the superblock's type
+    // whose payload is not a superblock: a record that passed its CRC
+    // and does not decode is exactly the damage a check has to REPORT
+    // rather than refuse.
+    let wreck = nvfsmeta.record(nvfsvol.record_type_superblock(), bytes.zeros(32))
+
+    var d = ram(g)
+    install(d, 0, meta_block([root, outside, big], prog, g.block_size, 1))
+    install(d, 3, meta_block([far], prog, g.block_size, 1))
+    install(d, 7, meta_block([wreck], prog, g.block_size, 1))
+
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("the check walks every block and reports each complaint by name")
+    // The configuration's own `file_max` is the bound the complaints
+    // are measured against, so a 4-byte bound makes the eight-byte file
+    // the "larger than this volume allows" case without a device that
+    // could actually hold a 2 GB file.
+    let tight = nvfsvol.config(100, 255, 4, 128)
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let ck = drive(d, nvfsop.begin_on(vol, tight, NvfsCheck), 400)
+            test.assert(is_done(ck))
+            let rep = report_of(ck)
+            test.assert(not nvfsop.report_is_clean(rep))
+            test.assert(rep.blocks_used == 3)
+            test.assert(rep.blocks_used + rep.blocks_free == g.block_count)
+            test.assert(rep.directories == 1)
+            test.assert(rep.files == 2)
+            test.assert(list.len(rep.problems) == 4)
+            test.assert(rep.directories + rep.files == 3)
+
+    test.case("and the four complaints are the four kinds of damage")
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let ck = drive(d, nvfsop.begin_on(vol, tight, NvfsCheck), 400)
+            let rep = report_of(ck)
+            test.assert(joined(rep.problems) != "")
+            test.assert(nvfsop.report_is_clean(nvfsop.empty_report()))
+
+@test
+fn test_a_check_still_adds_up_on_an_image_that_contradicts_itself() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let root = superblock_of(g, c)
+    var d = ram(g)
+    install(d, 0, meta_block([root], prog, g.block_size, 1))
+    install(d, 4, meta_block([entry_record(nvfsvol.inline_entry("a", bytes.from_str("x")))],
+                             prog, g.block_size, 1))
+
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("a clean volume's two counts are the device's own block count")
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let ck = drive(d, nvfsop.begin_on(vol, c, NvfsCheck), 400)
+            test.assert(is_done(ck))
+            let rep = report_of(ck)
+            test.assert(nvfsop.report_is_clean(rep))
+            test.assert(rep.blocks_used == 2)
+            test.assert(rep.blocks_used + rep.blocks_free == g.block_count)
+            test.assert(rep.files == 1)
+
+    test.case("a volume whose geometry is narrower than the walk still adds up")
+    // The deliberately inconsistent image: the DEVICE holds blocks, the
+    // volume says it holds none.  A count that exceeds the device is
+    // the one case the identity cannot express, and it is reported
+    // rather than quietly arithmetic'd away — a report whose two counts
+    // do not add up is the number a user is about to make a decision
+    // with.
+    let none = nvfsvol.geometry(16, 16, 512, 0)
+    let strange = nvfsvol.volume(none, nvfsvol.superblock(nvfsgeo.format_version(), 512, 0,
+                                                          255, 128, 2147483647, 100),
+                                                          1, 0)
+    let bad = drive(d, nvfsop.begin_on(strange, c, NvfsCheck), 400)
+    test.assert(is_done(bad))
+    let rep = report_of(bad)
+    test.assert(not nvfsop.report_is_clean(rep))
+    test.assert(rep.blocks_used > 0)
+    test.assert(rep.blocks_free == 0)
+    test.assert(rep.problems[0] != "")
+    test.assert(d.oob_reads == 0)
+
+// A problem list folded into one string, so a case can say "there is a
+// complaint" without asserting on the exact prose of a message.
+fn joined(problems: [Str]) -> Str
+    var out = ""
+    for p in problems
+        out = out + p + ";"
+    out
+
+// ---------------------------------------------------------------------------
+// The two directory arms a walk can reach: a name that is not a
+// directory, and an entry that is one.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_a_walk_into_a_directory_and_the_arms_that_refuse_one() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let root = superblock_of(g, c)
+    let sub = entry_record(nvfsvol.directory_entry("sub", 4, 5))
+    let file = entry_record(nvfsvol.inline_entry("file", bytes.from_str("x")))
+    let bad = entry_record(nvfsvol.directory_entry("bad", 40, 41))
+    let inner = entry_record(nvfsvol.inline_entry("inner", bytes.from_str("y")))
+
+    var d = ram(g)
+    install(d, 0, meta_block([root, sub, file, bad], prog, g.block_size, 1))
+    install(d, 4, meta_block([inner], prog, g.block_size, 1))
+
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+    var m = v.machine
+    var vol = nvfsvol.volume(g, nvfsvol.superblock(nvfsgeo.format_version(), 512, 32, 255, 128,
+                                                   2147483647, 100),
+                                                   1, 0)
+    match nvfsop.volume(m)
+        None     => test.assert(false)
+        Some(vv) =>
+            vol = vv
+
+    test.case("a path through a directory reads the directory's OWN log")
+    let st = next(d, m, NvfsStat("/sub/inner"), 400)
+    test.assert(is_done(st))
+    test.assert(statted_of(st).name == "inner")
+    m = st.machine
+
+    test.case("a listing of that directory is its own entries, not the root's")
+    // This case runs after a stat that descended into /sub, which is
+    // the point: the machine's pair is the walk's position, and an
+    // operation that did not re-seed it would look for "sub" in sub's
+    // own log and answer NotFound.
+    let ls = next(d, m, NvfsReadDir("/sub"), 400)
+    test.assert(is_done(ls))
+    test.assert(list.len(entries_of(ls)) == 1)
+    test.assert(named(entries_of(ls), 0) == "inner")
+    m = ls.machine
+
+    test.case("and the operation after it walks from the ROOT again")
+    let back = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(is_done(back))
+    test.assert(list.len(entries_of(back)) == 3)
+    m = back.machine
+
+    test.case("a commit inside it writes into that pair's log")
+    let rm = next(d, m, NvfsRemove("/sub/inner"), 400)
+    test.assert(completed(rm))
+    m = rm.machine
+    let gone = next(d, m, NvfsStat("/sub/inner"), 400)
+    test.assert(failed_with(gone, NvfsNotFound))
+    m = gone.machine
+
+    test.case("a component that is a file is NotDirectory, before its pair is read")
+    let nd = next(d, m, NvfsStat("/file/x"), 400)
+    test.assert(failed_with(nd, NvfsNotDirectory))
+    m = nd.machine
+
+    test.case("a component whose pair is past the device is Corrupt, before it is read")
+    let reads_before = d.reads
+    let cor = next(d, m, NvfsStat("/bad/x"), 400)
+    test.assert(failed_with(cor, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+    m = cor.machine
+
+    test.case("opening a directory is IsDirectory: a handle names a file")
+    let od = next(d, m, NvfsOpen("/sub", false), 400)
+    test.assert(failed_with(od, NvfsIsDirectory))
+    m = od.machine
+
+    test.case("and removing one is NotSupported: its tombstone would orphan its log")
+    let rd = next(d, m, NvfsRemove("/sub"), 400)
+    test.assert(failed_with(rd, NvfsNotSupported))
+    m = rd.machine
+
+    test.case("a handle resolved by path follows the name, so a rename can point it at a directory")
+    // A handle is a number AND a path: the walk resolves the path, so
+    // an operation through a handle sees whatever that name denotes
+    // NOW.  Moving the directory onto the name the handle holds is the
+    // way that happens, and every handle operation that needs a FILE
+    // has to refuse it.
+    let o = next(d, m, NvfsOpen("/file", false), 400)
+    test.assert(is_done(o))
+    let h = handle_of(o)
+    m = o.machine
+    let rf = next(d, m, NvfsRemove("/file"), 400)
+    test.assert(completed(rf))
+    m = rf.machine
+    let mv = next(d, m, NvfsRename("/sub", "/file"), 400)
+    test.assert(completed(mv))
+    m = mv.machine
+
+    test.case("reading, writing and truncating through it are all IsDirectory")
+    let r1 = next(d, m, NvfsReadFile(h, 1), 400)
+    test.assert(failed_with(r1, NvfsIsDirectory))
+    m = r1.machine
+    let w1 = next(d, m, NvfsWrite(h, bytes.from_str("z")), 400)
+    test.assert(failed_with(w1, NvfsIsDirectory))
+    m = w1.machine
+    let t1 = next(d, m, NvfsTruncate(h, 1), 400)
+    test.assert(failed_with(t1, NvfsIsDirectory))
+    m = t1.machine
+
+    test.case("through all of it the device was never read outside itself")
+    test.assert(d.oob_reads == 0)
+    test.assert(d.programmed_twice == 0)
+    test.assert(vol.geometry.block_size == 512)
+
+// ---------------------------------------------------------------------------
+// The chain arms a write and a truncation refuse, and the two ways a
+// chain read is bounded.
+// ---------------------------------------------------------------------------
+
+// A chain's data block: the pointer slots, then a payload of one byte.
+fn chain_data_block(g: nvfsvol.NvfsGeometry, previous: Int, byte: Int) -> Bytes
+    var b = erased(g.block_size)
+    if previous >= 0
+        bytes.set_u32_le(b, nvfsctz.pointer_offset(0), previous)
+    bytes.fill(b, nvfsctz.data_offset(g.block_count),
+               nvfsctz.capacity(g.block_size, g.block_count), byte)
+    b
+
+@test
+fn test_a_chain_file_refuses_the_two_operations_it_cannot_do() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let cap = nvfsctz.capacity(g.block_size, g.block_count)
+    let root = superblock_of(g, c)
+    let big = entry_record(nvfsvol.chain_entry("big", 5, cap * 2))
+
+    var d = ram(g)
+    install(d, 0, meta_block([root, big], prog, g.block_size, 1))
+    install(d, 4, chain_data_block(g, 0 - 1, 65))
+    install(d, 5, chain_data_block(g, 4, 66))
+
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+    var m = v.machine
+    var h = 0 - 1
+    match nvfsop.volume(m)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, c, NvfsOpen("/big", false)), 64)
+            test.assert(is_done(o))
+            h = handle_of(o)
+            m = o.machine
+    test.assert(h >= 0)
+
+    test.case("a write to a chain file is NotSupported: growing one allocates a block")
+    let w = next(d, m, NvfsWrite(h, bytes.from_str("more")), 400)
+    test.assert(failed_with(w, NvfsNotSupported))
+    m = w.machine
+
+    test.case("and so is a truncation of one")
+    let t = next(d, m, NvfsTruncate(h, 4), 400)
+    test.assert(failed_with(t, NvfsNotSupported))
+    m = t.machine
+
+    test.case("a read past the end of the chain is no bytes, not a walk off it")
+    let s = next(d, m, NvfsSeek(h, cap * 2, 0), 400)
+    test.assert(position_of(s) == cap * 2)
+    m = s.machine
+    let r = next(d, m, NvfsReadFile(h, 4), 400)
+    test.assert(is_done(r))
+    test.assert(bytes.len(data_of(r)) == 0)
+    m = r.machine
+
+    test.case("and a walk whose head names a block past the device is Corrupt")
+    var e = ram(g)
+    install(e, 0, meta_block([root, entry_record(nvfsvol.chain_entry("big", 99, cap * 2))],
+                             prog, g.block_size, 1))
+    let v2 = drive(e, nvfsop.begin(g, c, NvfsMount), 64)
+    match nvfsop.volume(v2.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(e, nvfsop.begin_on(vol, c, NvfsOpen("/big", false)), 64)
+            let rd = drive(e, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(e.oob_reads == 0)
+    test.assert(d.programmed_twice == 0)
+
+@test
+fn test_a_chain_read_refuses_a_block_that_came_back_short_and_one_that_cannot_hold_payload() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let cap = nvfsctz.capacity(g.block_size, g.block_count)
+    let root = superblock_of(g, c)
+    let big = entry_record(nvfsvol.chain_entry("big", 5, cap * 2))
+
+    test.case("a host that answers fewer bytes than the block it named is Corrupt")
+    var d = ram(g)
+    install(d, 0, meta_block([root, big], prog, g.block_size, 1))
+    install(d, 4, chain_data_block(g, 0 - 1, 65))
+    install(d, 5, chain_data_block(g, 4, 66))
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, c, NvfsOpen("/big", false)), 64)
+            // The head is the first block the read asks for, and it
+            // comes back half a block: the bytes this step would index
+            // are simply not in hand.
+            d.short_block = 5
+            let rd = drive(d, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+
+    test.case("a geometry whose blocks cannot hold their own pointer slots has no chain")
+    // A 32-byte block with nine slots in front of every payload: the
+    // device cannot hold a chain at all, and the read refuses before it
+    // computes an index into a block that has no payload.
+    let tiny = nvfsvol.geometry(8, 8, 32, 4096)
+    test.assert(nvfsctz.capacity(tiny.block_size, tiny.block_count) == 0)
+    let small_entry = entry_record(nvfsvol.chain_entry("b", 0, 512))
+    var e = ram(g)
+    install(e, 0, meta_block([small_entry], 8, 32, 1))
+    let vol = nvfsvol.volume(tiny, nvfsvol.superblock(nvfsgeo.format_version(), 32, 4096,
+                                                      4, 128, 2147483647, 100),
+                                                      1, 0)
+    let o = drive(e, nvfsop.begin_on(vol, c, NvfsOpen("/b", false)), 64)
+    test.assert(is_done(o))
+    let rd = drive(e, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+    test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(e.oob_reads == 0)
+
+// ---------------------------------------------------------------------------
+// The arms a DAMAGED image reaches: a pair that cannot be read, a
+// directory whose log is gone, and the two names a directory operation
+// refuses before it writes.
+//
+// Every image below is built by hand and installed, because these are
+// the states a part comes back in after a power cut rather than the
+// states an operation produces.
+// ---------------------------------------------------------------------------
+
+// A root pair that was cut in the middle of a compaction: records with
+// no sealed revision, on a block that is not blank either.
+fn unsealed_block(prog: Int, block_size: Int) -> Bytes
+    erased(prog) + bytes.zeros(16) + erased(block_size - prog - 16)
+
+@test
+fn test_a_mount_refuses_a_root_pair_that_is_neither_sealed_nor_blank() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+
+    test.case("a device with nothing on it is NoFilesystem, not Corrupt")
+    var blank = ram(g)
+    test.assert(failed_with(drive(blank, nvfsop.begin(g, c, NvfsMount), 64), NvfsNoFilesystem))
+
+    test.case("a root pair whose log was cut before its seal is Corrupt")
+    // Records that do not add up and no revision word: the image a
+    // compaction interrupted between its last record and its seal
+    // leaves.  It is NOT blank, so a boot sequence must not format over
+    // it — those records are the only copy of what the volume held, and
+    // the answer is Corrupt rather than "no filesystem here".
+    var torn = ram(g)
+    install(torn, 0, unsealed_block(prog, g.block_size))
+    test.assert(failed_with(drive(torn, nvfsop.begin(g, c, NvfsMount), 64), NvfsCorrupt))
+    test.assert(torn.oob_reads == 0)
+
+    test.case("and a sealed pair whose superblock does not decode is Corrupt too")
+    // The record passed its CRC — it IS a record, of the superblock's
+    // own type — and its payload is not a superblock.  A mount that
+    // believed it would answer a volume built from garbage.
+    var wreck = ram(g)
+    install(wreck, 0, meta_block([nvfsmeta.record(nvfsvol.record_type_superblock(),
+                                                  bytes.zeros(16))],
+                                 prog, g.block_size, 1))
+    test.assert(failed_with(drive(wreck, nvfsop.begin(g, c, NvfsMount), 64), NvfsCorrupt))
+    test.assert(wreck.oob_reads == 0)
+
+@test
+fn test_a_walk_refuses_a_missing_component_and_a_pair_that_is_not_there() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let root = superblock_of(g, c)
+
+    test.case("a component that is not in the directory is NotFound")
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    let miss = next(d, f.machine, NvfsStat("/nope/x"), 400)
+    test.assert(failed_with(miss, NvfsNotFound))
+
+    test.case("a directory whose pair was erased is Corrupt, before its pair is read")
+    // The entry is plausible — 4 and 5 are blocks of this device — and
+    // the blocks were erased afterwards.  A directory with no log is
+    // not an empty directory: the log is the directory, so this is an
+    // image that lost it, and the walk refuses rather than answering a
+    // listing nothing ever wrote.
+    var e = ram(g)
+    install(e, 0, meta_block([root, entry_record(nvfsvol.directory_entry("sub", 4, 5))],
+                             prog, g.block_size, 1))
+    let v = drive(e, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let deep = drive(e, nvfsop.begin_on(vol, c, NvfsStat("/sub/x")), 64)
+            test.assert(failed_with(deep, NvfsCorrupt))
+    test.assert(e.oob_reads == 0)
+
+@test
+fn test_a_name_that_is_taken_and_a_name_past_the_bound_are_refused_by_name() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    let o = next(d, m, NvfsOpen("/here", true), 400)
+    test.assert(is_done(o))
+    m = o.machine
+
+    test.case("a mkdir of a name that is already there is Exists, not a second entry")
+    let taken = next(d, m, NvfsMkdir("/here"), 400)
+    test.assert(failed_with(taken, NvfsExists))
+    m = taken.machine
+
+    test.case("and an open that would create one past the bound is NameTooLong")
+    // A name longer than the bound the volume was made with: refused
+    // where it is created, because the entry that would name it is one
+    // an older reader could not hold.
+    let long = next(d, m, NvfsOpen("/" + long_name(300), true), 400)
+    test.assert(failed_with(long, NvfsNameTooLong))
+    m = long.machine
+
+    test.case("and neither of them wrote a byte: both are refused before the log")
+    let after = next(d, m, NvfsReadDir("/"), 400)
+    test.assert(list.len(entries_of(after)) == 1)
+    test.assert(named(entries_of(after), 0) == "here")
+    test.assert(d.programmed_twice == 0)
+
+@test
+fn test_two_handles_at_once_and_what_closing_one_of_them_leaves() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    let oa = next(d, m, NvfsOpen("/a", true), 400)
+    test.assert(is_done(oa))
+    let ha = handle_of(oa)
+    m = oa.machine
+    let ob = next(d, m, NvfsOpen("/b", true), 400)
+    test.assert(is_done(ob))
+    let hb = handle_of(ob)
+    m = ob.machine
+    test.assert(ha != hb)
+
+    test.case("a seek moves the handle it names while the other one is in the table")
+    // The table is a list of id/position pairs walked two at a time, so
+    // the entry that is NOT moved is the one that catches a rewrite
+    // that dropped the rest of the table.
+    let sa = next(d, m, NvfsSeek(ha, 3, 0), 400)
+    test.assert(position_of(sa) == 3)
+    m = sa.machine
+    let rb = next(d, m, NvfsReadFile(hb, 2), 400)
+    test.assert(is_done(rb))
+    m = rb.machine
+
+    test.case("closing one of two leaves the other open, with its own path")
+    test.assert(nvfsop.handle_is_open(m, ha))
+    test.assert(nvfsop.handle_is_open(m, hb))
+    let cl = next(d, m, NvfsClose(ha), 400)
+    test.assert(completed(cl))
+    m = cl.machine
+    test.assert(not nvfsop.handle_is_open(m, ha))
+    test.assert(nvfsop.handle_is_open(m, hb))
+
+    test.case("and the survivor still names its own file")
+    let r = next(d, m, NvfsReadFile(hb, 2), 400)
+    test.assert(is_done(r))
+    let s = next(d, r.machine, NvfsSeek(ha, 1, 0), 400)
+    test.assert(failed_with(s, NvfsNotFound))
+    test.assert(d.programmed_twice == 0)
+
+@test
+fn test_a_handle_outlives_its_file_and_a_zero_length_read_is_no_bytes() [io]
+    let g = small_geometry()
+    let c = seeded()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, c, NvfsFormat), 400)
+    test.assert(is_done(f))
+    var m = f.machine
+
+    let o = next(d, m, NvfsOpen("/f", true), 400)
+    test.assert(is_done(o))
+    let h = handle_of(o)
+    m = o.machine
+    let w = next(d, m, NvfsWrite(h, bytes.from_str("hello")), 400)
+    test.assert(written_of(w) == 5)
+    m = w.machine
+    let s0 = next(d, m, NvfsSeek(h, 0, 0), 400)
+    test.assert(position_of(s0) == 0)
+    m = s0.machine
+
+    test.case("a read of zero bytes is no bytes, and it does not move the cursor")
+    // The cursor is at zero, and the read after it answers the FILE'S
+    // FIRST BYTE: an arm that answered no bytes and moved anyway would
+    // have eaten it.
+    let z = next(d, m, NvfsReadFile(h, 0), 400)
+    test.assert(is_done(z))
+    test.assert(bytes.len(data_of(z)) == 0)
+    m = z.machine
+    let first = next(d, m, NvfsReadFile(h, 1), 400)
+    test.assert(is_done(first))
+    test.assert(byte_of(data_of(first), 0) == 104)
+    m = first.machine
+
+    test.case("a removed file leaves the handle open, and every operation through it NotFound")
+    // The handle names a PATH, so the walk after the removal finds the
+    // name gone: the entry is what a file IS here, and a handle is not
+    // a slot nothing else in the format numbers.
+    let rm = next(d, m, NvfsRemove("/f"), 400)
+    test.assert(completed(rm))
+    m = rm.machine
+    test.assert(nvfsop.handle_is_open(m, h))
+    let r = next(d, m, NvfsReadFile(h, 4), 400)
+    test.assert(failed_with(r, NvfsNotFound))
+    m = r.machine
+    let wr = next(d, m, NvfsWrite(h, bytes.from_str("x")), 400)
+    test.assert(failed_with(wr, NvfsNotFound))
+    m = wr.machine
+    let tr = next(d, m, NvfsTruncate(h, 1), 400)
+    test.assert(failed_with(tr, NvfsNotFound))
+    m = tr.machine
+    let sk = next(d, m, NvfsSeek(h, 1, 0), 400)
+    test.assert(failed_with(sk, NvfsNotFound))
+    test.assert(d.programmed_twice == 0)
+
+@test
+fn test_a_chain_read_refuses_an_entry_larger_than_the_volume_allows() [io]
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let cap = nvfsctz.capacity(g.block_size, g.block_count)
+    let root = superblock_of(g, c)
+
+    var d = ram(g)
+    install(d, 0, meta_block([root, entry_record(nvfsvol.chain_entry("big", 5, cap * 2))],
+                             prog, g.block_size, 1))
+    install(d, 4, chain_data_block(g, 0 - 1, 65))
+    install(d, 5, chain_data_block(g, 4, 66))
+
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("a size past the volume's own bound is Corrupt, before the walk is started")
+    // `file_max` is the caller's setting and the entry's size is the
+    // image's claim: a chain claiming more bytes than this volume could
+    // ever hold is a walk this code will not begin, whatever the
+    // pointers say.
+    let tight = nvfsvol.config(100, 255, 4, 128)
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, tight, NvfsOpen("/big", false)), 64)
+            test.assert(is_done(o))
+            let rd = drive(d, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+    test.assert(d.programmed_twice == 0)
+
+@test
+fn test_a_check_has_nothing_to_say_about_a_directory_entry_that_is_sound() [io]
+    // The empty-string arm of the per-entry complaint: a directory whose
+    // pair is two distinct blocks of this device.  A check that
+    // complained about every directory would be a check nobody reads.
+    let g = small_geometry()
+    let c = seeded()
+    let prog = g.prog_size
+    let root = superblock_of(g, c)
+
+    var d = ram(g)
+    install(d, 0, meta_block([root, entry_record(nvfsvol.directory_entry("sub", 4, 5))],
+                             prog, g.block_size, 1))
+    let v = drive(d, nvfsop.begin(g, c, NvfsMount), 64)
+    test.assert(is_done(v))
+
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let ck = drive(d, nvfsop.begin_on(vol, c, NvfsCheck), 400)
+            test.assert(is_done(ck))
+            let rep = report_of(ck)
+            test.assert(list.len(rep.problems) == 0)
+            test.assert(nvfsop.report_is_clean(rep))
+            test.assert(rep.directories == 1)
+            test.assert(rep.files == 0)
+            test.assert(rep.blocks_used == 1)
+            test.assert(rep.blocks_used + rep.blocks_free == g.block_count)
+    test.assert(d.oob_reads == 0)

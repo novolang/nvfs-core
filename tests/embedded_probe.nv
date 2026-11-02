@@ -25,22 +25,36 @@
 // stack frame.
 //
 // WHAT IT DOES NOT COVER, and the honest form of the claim is saying
-// so: `nvfsmeta`, `nvfsvol` and `nvfsop` are NOT in the probe and are
-// not claimed.  A record holds `Bytes`, a directory fold builds a list
-// of entries, and the machine holds an action whose payload is a
-// buffer — every one of them allocates by construction and not by
-// accident.  A firmware that wants those wants a heap; a firmware that
-// wants to walk a chain and commit a record into a buffer it already
-// owns wants exactly the three modules below.
+// so: `nvfsmeta`, `nvfsvol` and `nvfsop` are NOT called by this probe
+// and their bodies are not exercised on a device.  A record holds
+// `Bytes`, a directory fold builds a list of entries, and the machine
+// holds an action whose payload is a buffer — every one of them
+// allocates by construction and not by accident.  A firmware that wants
+// those wants a heap; a firmware that wants to walk a chain and commit
+// a record into a buffer it already owns wants exactly the three
+// modules below.
 //
-// WHAT THE TIER ACTUALLY CHECKS AT 0.0.1 is narrower than it will be,
-// and saying so is more useful than pretending otherwise: every body
-// under `src/` is a `todo()`, so what links today is the SIGNATURES and
-// the types — `Int`s in and out, and two `@value` structs passed and
-// returned whole.  There is no walk in the binary yet, so this does not
-// prove a seek is allocation-free; it proves that nothing in the shape
-// of the surface needs an allocator or a host.  Keeping it green once
-// the bodies land is a named cost of the implementation step.
+// THEY ARE STILL COMPILED, which is the other half of the claim: a
+// device build compiles every module under `src/` and checks an
+// unannotated function as device code, so each function of those three
+// modules carries `@tier(app)` and is checked at the application tier
+// instead.  That is what makes the package-root build — this file
+// staged under `src/`, so that the package's own modules AND its
+// dependencies are all in the compilation — come out green:
+//
+//   cp tests/embedded_probe.nv src/zz_probe_tmp.nv
+//   novo build --target=nrf52-qemu src/zz_probe_tmp.nv
+//
+// A build of this file where it sits resolves `src/` but not the
+// dependencies, so it is the weaker of the two routes.
+//
+// WHAT THIS PROVES, AND WHAT IT DOES NOT.  The bodies are implemented,
+// so the build links the walk itself rather than a stub that panics, and
+// `score` below calls it.  But a device build is a COMPILE and not a
+// run: what it proves is that the three modules it calls are inside the
+// device claim — no allocator, no host, no type that owns a buffer — and
+// not that a seek at run time is allocation-free.  What RUNS is
+// `tests/nvfsctz_tests.nv`, on the host, against the same functions.
 
 use nvfsctz
 use nvfsgeo
@@ -101,7 +115,7 @@ fn score() -> Int
     let w0 = nvfsctz.walk(41, 9, 1)
     if nvfsctz.walk_block(w0) == 41
         n = n + 1
-    if nvfsctz.walk_done(w0) == false
+    if not nvfsctz.walk_done(w0)
         n = n + 1
     let jump = nvfsctz.walk_jump(w0, 9)
     if jump >= 0
@@ -118,10 +132,10 @@ fn score() -> Int
     // Arbitration: the higher sealed revision wins.
     if nvfswear.winner(3, true, 4, true) == 1
         n = n + 1
-    if nvfswear.revision_is_sealed(nvfsgeo.erased_word()) == false
+    if not nvfswear.revision_is_sealed(nvfsgeo.erased_word())
         n = n + 1
     // A torn block is full whatever space it appears to have.
-    if nvfswear.append_allowed(true, 512, 48, 4096) == false
+    if not nvfswear.append_allowed(true, 512, 48, 4096)
         n = n + 1
     if nvfswear.append_allowed(false, 512, 48, 4096)
         n = n + 1
@@ -142,12 +156,13 @@ fn score() -> Int
 @tier(rt)
 fn main() [hw, time]
     bsp.board.init()
-    // 27 is the number of checks in `score` on the path a linked build
-    // takes.  The count is printed on a failure rather than only
-    // compared, so a device that disagrees with the host says HOW MANY
-    // it lost and a bisect has somewhere to start.
+    // 28 is the number of checks in `score`.  The count is compared
+    // rather than only printed, so a device that disagrees with the host
+    // says HOW MANY it lost and a bisect has somewhere to start — and
+    // the number is the count of `if`s in `score`, which is what makes
+    // it checkable by reading.  It read 27 against a function with 28.
     let n = score()
-    if n == 27
+    if n == 28
         hal.uart.write("PASS: nvfs-core-embedded\n")
     else
         hal.uart.write("FAIL: nvfs-core-embedded\n")

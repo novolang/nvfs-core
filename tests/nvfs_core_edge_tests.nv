@@ -1,0 +1,671 @@
+// nvfs_core_edge_tests.nv — the four claims the core rests on, pinned
+// on a real device.
+//
+// `nvfsop_tests.nv` drives the machine and shows what the action-as-a-
+// value shape buys.  This suite asks the four questions a filesystem's
+// core is really being trusted with, and it asks each one over a block
+// array rather than over a shortcut:
+//
+//   1. THE CRC IS CHECKED AGAINST DAMAGE, NOT AGAINST HEALTH.  A bit
+//      flipped in the type byte, the length field, the payload or the
+//      CRC field itself must all end the log, and the CRC must cover
+//      exactly the header and the payload and not its own four bytes.
+//   2. EVERY BOUND IS CHECKED BEFORE THE BOUND IS USED.  A directory
+//      pair, a chain head and a length that reach past what the device
+//      has are refused BEFORE the read they would need — which is a
+//      claim the device can witness, because this device counts the
+//      reads whose range was outside it.
+//   3. A BLOCK OFFSET AND A BYTE OFFSET ARE DIFFERENT NUMBERS.  With
+//      sixteen-byte blocks the two coincide and a bug between them
+//      hides; this suite runs 512-byte blocks and asserts the byte
+//      arithmetic, then reads a chain whose payload starts 24 bytes
+//      into every block and shows the pointer slots are not in it.
+//   4. FREE-SPACE ACCOUNTING SURVIVES AN IMAGE THAT CONTRADICTS THE
+//      DEVICE.  An image built for another part is refused by a mount
+//      and REPORTED by a check, and the report's two counts still add
+//      up to the device's block count rather than the image's.
+//
+// The device is three functions over one `Bytes`.  A read answers the
+// bytes at a byte offset and counts the ones outside the device; a
+// program is NOR programming and REFUSES to write a byte that is not
+// erased; an erase fills a block.  The counters are the point: a suite
+// that only looked at answers could not tell "checked the bound and
+// refused" from "read off the end of the device and happened to live".
+
+use std.test
+use std.bytes
+use std.list
+use nvfsctz
+use nvfsgeo
+use nvfsmeta
+use nvfsop
+use nvfsvol
+
+fn small_geometry() -> nvfsvol.NvfsGeometry
+    nvfsvol.geometry(16, 16, 512, 32)
+
+fn seeded() -> nvfsvol.NvfsConfig
+    nvfsvol.default_config()
+
+fn erased(n: Int) -> Bytes
+    bytes.from_byte_list(list.range(0, n) |> list.map(_ => nvfsgeo.erased_byte()))
+
+// ---------------------------------------------------------------------------
+// A device, and the host that performs its actions.
+// ---------------------------------------------------------------------------
+
+// One flat byte array, the geometry it belongs to, and the counters.
+//
+// `oob_reads` counts reads whose block or range was outside the device,
+// `oob_progs` the same for programs and erases, and `programmed_twice`
+// counts programs into a byte that was not erased — the one thing NOR
+// programming forbids, which a strict device can refuse where a real
+// part would silently AND the bits down.
+struct Ram
+    geometry: nvfsvol.NvfsGeometry
+    var data: Bytes
+    var reads: Int
+    var oob_reads: Int
+    var progs: Int
+    var oob_progs: Int
+    var erases: Int
+    var programmed_twice: Int
+    var read_blocks: [Int]
+
+fn ram(g: nvfsvol.NvfsGeometry) -> Ram
+    Ram { geometry: g, data: erased(g.block_size * g.block_count), reads: 0,
+          oob_reads: 0, progs: 0, oob_progs: 0, erases: 0, programmed_twice: 0,
+          read_blocks: [] }
+
+// Where a block starts, as a byte offset.  The one conversion this file
+// is about, and it is spelled once.
+fn block_at(d: Ram, block: Int) -> Int
+    block * d.geometry.block_size
+
+fn within(d: Ram, at: Int, len: Int) -> Bool
+    at >= 0 and len >= 0 and at + len <= bytes.len(d.data)
+
+// A factory image: bytes written into a block directly, because a
+// caller holding an image is not a device programming it.
+fn install(var d: Ram, block: Int, image: Bytes)
+    let at = block_at(d, block)
+    if within(d, at, bytes.len(image))
+        bytes.copy_into(d.data, at, image, 0, bytes.len(image))
+
+fn all_erased(d: Ram, at: Int, len: Int) -> Bool
+    var clean = true
+    var i = 0
+    while i < len
+        if (bytes.byte_at(d.data, at + i) ?? 0) != nvfsgeo.erased_byte()
+            clean = false
+        i = i + 1
+    clean
+
+// littlefs's four callbacks, over the byte array.
+fn perform(var d: Ram, a: nvfsop.NvfsAction) -> nvfsop.NvfsAnswer
+    match a
+        NvfsRead(block, off, len)     =>
+            d.reads = d.reads + 1
+            let at = block_at(d, block)
+            if block < 0 or block >= d.geometry.block_count
+                or not within(d, at + off, len)
+                d.oob_reads = d.oob_reads + 1
+                NvfsGotBytes(bytes.zeros(0))
+            else
+                d.read_blocks = list.push(d.read_blocks, block)
+                NvfsGotBytes(bytes.slice(d.data, at + off, at + off + len))
+        NvfsProg(block, off, payload) =>
+            d.progs = d.progs + 1
+            let at = block_at(d, block)
+            if block < 0 or block >= d.geometry.block_count
+                or not within(d, at + off, bytes.len(payload))
+                d.oob_progs = d.oob_progs + 1
+                NvfsGotOk(false)
+            elif not all_erased(d, at + off, bytes.len(payload))
+                d.programmed_twice = d.programmed_twice + 1
+                NvfsGotOk(false)
+            else
+                bytes.copy_into(d.data, at + off, payload, 0, bytes.len(payload))
+                NvfsGotOk(true)
+        NvfsErase(block)              =>
+            d.erases = d.erases + 1
+            if block < 0 or block >= d.geometry.block_count
+                d.oob_progs = d.oob_progs + 1
+                NvfsGotOk(false)
+            else
+                bytes.fill(d.data, block_at(d, block), d.geometry.block_size,
+                           nvfsgeo.erased_byte())
+                NvfsGotOk(true)
+        NvfsSync                      => NvfsGotOk(true)
+
+fn drive(var d: Ram, start: nvfsop.NvfsProgress, budget: Int) -> nvfsop.NvfsProgress
+    var p = start
+    var steps = 0
+    var running = true
+    while running and steps < budget
+        match p.step
+            NvfsNeed(a)   =>
+                p = nvfsop.resume(p.machine, perform(d, a))
+            NvfsDone(_)   =>
+                running = false
+            NvfsFailed(_) =>
+                running = false
+        steps = steps + 1
+    p
+
+fn is_done(p: nvfsop.NvfsProgress) -> Bool
+    match p.step
+        NvfsDone(_) => true
+        _           => false
+
+fn failed_with(p: nvfsop.NvfsProgress, e: nvfsgeo.NvfsError) -> Bool
+    match p.step
+        NvfsFailed(got) => nvfsgeo.error_name(got) == nvfsgeo.error_name(e)
+        _               => false
+
+fn data_of(p: nvfsop.NvfsProgress) -> Bytes
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsData(d) => bytes.clone(d)
+                _           => bytes.zeros(0)
+        _           => bytes.zeros(0)
+
+fn handle_of(p: nvfsop.NvfsProgress) -> Int
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsHandle(h) => h
+                _             => -1
+        _           => -1
+
+fn report_of(p: nvfsop.NvfsProgress) -> nvfsop.NvfsReport
+    match p.step
+        NvfsDone(r) =>
+            match r
+                NvfsChecked(rep) => rep
+                _                => nvfsop.empty_report()
+        _           => nvfsop.empty_report()
+
+// ---------------------------------------------------------------------------
+// Images, built by hand.
+// ---------------------------------------------------------------------------
+
+// A metadata block: the revision page, then the records from the meta
+// offset on, then erased free space.
+//
+// This is the layout the format says a block has, written out where a
+// test can read it rather than derived from the machine that reads it.
+fn meta_block(records: [nvfsmeta.NvfsRecord], prog: Int, block_size: Int, revision: Int) -> Bytes
+    let seal = nvfsmeta.seal_image(revision, prog)
+    let image = nvfsmeta.compaction_image(records, prog)
+    let used = bytes.len(seal) + bytes.len(image)
+    if used >= block_size
+        seal + image
+    else
+        seal + image + erased(block_size - used)
+
+fn superblock_of(device: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_superblock(), nvfsvol.encode_superblock(device, c))
+
+fn entry_record(e: nvfsvol.NvfsEntry) -> nvfsmeta.NvfsRecord
+    nvfsmeta.record(nvfsvol.record_type_entry(), nvfsvol.encode_entry(e))
+
+// A chain's data block: the pointer slots, then a payload of one byte.
+//
+// `previous` below zero writes no pointer, which is what the first block
+// of a chain has.  The slots are left erased, so a read that started at
+// the block's first byte instead of its payload would answer 0xFF rather
+// than the payload byte.
+fn chain_data_block(g: nvfsvol.NvfsGeometry, previous: Int, byte: Int) -> Bytes
+    var b = erased(g.block_size)
+    if previous >= 0
+        bytes.set_u32_le(b, nvfsctz.pointer_offset(0), previous)
+    bytes.fill(b, nvfsctz.data_offset(g.block_count),
+               nvfsctz.capacity(g.block_size, g.block_count), byte)
+    b
+
+// One bit of one byte, flipped: the smallest damage there is, and the
+// same damage a failing cell produces.
+fn flip_low_bit(b: Bytes, i: Int) -> Bytes
+    var out = bytes.clone(b)
+    let v = bytes.byte_at(out, i) ?? 0
+    if v % 2 == 0
+        bytes.set_u8(out, i, v + 1)
+    else
+        bytes.set_u8(out, i, v - 1)
+    out
+
+// ---------------------------------------------------------------------------
+// 1. The CRC, against damage.
+// ---------------------------------------------------------------------------
+
+// Whether damage at one byte of the record is caught: the byte really
+// changed, and the stored value no longer answers what the body says.
+//
+// The comparison is the scanner's own — `record_crc` over the bytes the
+// format says the CRC covers against the four bytes after them — so this
+// asks the question the reader asks, one byte at a time.
+fn damage_is_caught(img: Bytes, i: Int) -> Bool
+    let flipped = flip_low_bit(img, i)
+    let crc_at = bytes.len(flipped) - 4
+    let was = bytes.byte_at(img, i) ?? 0
+    let now = bytes.byte_at(flipped, i) ?? 0
+    was != now
+        and nvfsmeta.record_crc(bytes.slice(flipped, 0, crc_at))
+            != (bytes.u32_le_at(flipped, crc_at) ?? 0)
+
+@test
+fn test_the_crc_covers_the_header_and_the_payload_and_not_itself() [io]
+    let e = nvfsvol.inline_entry("boot", bytes.from_str("abcd"))
+    let img = nvfsmeta.encode_record(entry_record(e))
+    let n = bytes.len(img)
+    let crc_at = n - 4
+    let body = bytes.slice(img, 0, crc_at)
+    let stored = bytes.u32_le_at(img, crc_at) ?? 0
+
+    test.case("health first, so that damage below is a change and not a constant")
+    test.assert(nvfsmeta.record_crc(body) == stored)
+
+    test.case("the CRC covers the four header bytes: type, flags and length")
+    test.assert(damage_is_caught(img, 0))
+    test.assert(damage_is_caught(img, 1))
+    test.assert(damage_is_caught(img, 2))
+    test.assert(damage_is_caught(img, 3))
+
+    test.case("and it covers the payload, first byte to last")
+    test.assert(damage_is_caught(img, 4))
+    test.assert(damage_is_caught(img, crc_at - 1))
+
+    test.case("it does NOT cover its own four bytes")
+    // Damage confined to the CRC field leaves the recomputed value
+    // EQUAL to the original one, which is only true of a checksum that
+    // stops before itself: a CRC covering its own field could never be
+    // checked, because the bytes it would check do not exist until it
+    // has been computed.
+    let only_crc = flip_low_bit(img, crc_at)
+    test.assert((bytes.u32_le_at(only_crc, crc_at) ?? 0) != stored)
+    test.assert(nvfsmeta.record_crc(bytes.slice(only_crc, 0, crc_at)) == stored)
+
+    test.case("the field a damaged CRC field is compared against really moved")
+    test.assert(damage_is_caught(img, crc_at))
+
+// Whether an image scans as a block whose log was cut short: no live
+// records, a torn log, and the end at the block size — the two things a
+// damaged tail must do, because the bytes after it can never be
+// rewritten.
+fn log_ends(img: Bytes, prog: Int, block_size: Int) -> Bool
+    let s = nvfsmeta.scan_block(prog, block_size, img)
+    list.len(nvfsmeta.scan_records(s)) == 0
+        and nvfsmeta.scan_torn(s)
+        and nvfsmeta.scan_end(s) == block_size
+
+@test
+fn test_one_flipped_bit_ends_a_block_and_the_whole_block_goes_full() [io]
+    let g = small_geometry()
+    let prog = g.prog_size
+    let at = nvfsgeo.meta_offset(prog)
+    let r = entry_record(nvfsvol.inline_entry("boot", bytes.from_str("abcd")))
+    let healthy = meta_block([r], prog, g.block_size, 1)
+
+    test.case("the same block undamaged holds one record and is not torn")
+    let s = nvfsmeta.scan_block(prog, g.block_size, healthy)
+    test.assert(nvfsmeta.scan_valid(s))
+    test.assert(list.len(nvfsmeta.scan_records(s)) == 1)
+    test.assert(not nvfsmeta.scan_torn(s))
+    test.assert(nvfsmeta.scan_end(s) == at + 32)
+
+    test.case("a bit in the type byte ends the log")
+    test.assert(log_ends(flip_low_bit(healthy, at), prog, g.block_size))
+
+    test.case("a bit in the length field ends the log")
+    test.assert(log_ends(flip_low_bit(healthy, at + 2), prog, g.block_size))
+
+    test.case("a bit in the payload ends the log")
+    test.assert(log_ends(flip_low_bit(healthy, at + 12), prog, g.block_size))
+
+    test.case("a bit in the CRC field itself ends the log")
+    // The record is 26 bytes — four of header, eighteen of payload and
+    // four of CRC — so the CRC field is `at + 22` through `at + 25`.
+    // A bit in the PADDING after it is NOT caught, and the case below
+    // says so: padding is free space to the next scan, which is why the
+    // erased byte and not zero is what a pad writes.
+    test.assert(log_ends(flip_low_bit(healthy, at + 22), prog, g.block_size))
+
+    test.case("a length that reaches past what was read slices nothing")
+    var huge = bytes.clone(healthy)
+    bytes.set_u16_le(huge, at + 2, 65535)
+    test.assert(log_ends(huge, prog, g.block_size))
+
+    test.case("a block cut short by a short read is not read past its bytes")
+    test.assert(log_ends(bytes.slice(healthy, 0, at + 2), prog, g.block_size))
+
+    test.case("a bit in the padding after a record is free space, not damage")
+    // The next record is reached by alignment, so the erased bytes
+    // between records are never read: damage there is invisible to a
+    // scan by design, which is why a pad writes the erased byte rather
+    // than zero and why this asserts the design instead of a bug.
+    let padded = nvfsmeta.scan_block(prog, g.block_size, flip_low_bit(healthy, at + 26))
+    test.assert(list.len(nvfsmeta.scan_records(padded)) == 1)
+    test.assert(not nvfsmeta.scan_torn(padded))
+
+// ---------------------------------------------------------------------------
+// 2. Every bound, before the bound is used.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_every_bound_refuses_before_the_read_it_would_need() [io]
+    test.case("a directory pair: past the device, negative, or not a pair")
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("d", 32, 33), 32))
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("d", 0, 32), 32))
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("d", 0, 0), 32))
+    test.assert(not nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("d", -1, 1), 32))
+    test.assert(nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("d", 0, 1), 32))
+
+    test.case("a chain head: the absent word, or any block past the device")
+    test.assert(not nvfsctz.pointer_is_plausible(nvfsctz.absent_pointer(), 32))
+    test.assert(not nvfsctz.pointer_is_plausible(32, 32))
+    test.assert(not nvfsctz.pointer_is_plausible(-1, 32))
+    test.assert(nvfsctz.pointer_is_plausible(31, 32))
+
+    test.case("an access: a length past the block, from a valid offset too")
+    test.assert(nvfsgeo.access_is_valid(512, 1, 500, 12))
+    test.assert(not nvfsgeo.access_is_valid(512, 1, 500, 13))
+    test.assert(not nvfsgeo.access_is_valid(512, 1, 512, 1))
+    test.assert(not nvfsgeo.access_is_valid(512, 1, 0, 513))
+
+@test
+fn test_a_dirent_outside_the_device_is_refused_before_the_device_is_asked() [io]
+    let g = small_geometry()
+    let prog = g.prog_size
+    let root = superblock_of(g, seeded())
+    let outside = entry_record(nvfsvol.directory_entry("d", 40, 41))
+    var d = ram(g)
+    install(d, 0, meta_block([root, outside], prog, g.block_size, 1))
+
+    test.case("the mount reads the root pair and finds the volume")
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("a walk into that dirent is Corrupt, and block 40 was never read")
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let w = drive(d, nvfsop.begin_on(vol, seeded(), NvfsReadDir("/d")), 64)
+            test.assert(failed_with(w, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+
+@test
+fn test_a_chain_head_outside_the_device_is_refused_before_the_device_is_asked() [io]
+    let g = small_geometry()
+    let prog = g.prog_size
+    let root = superblock_of(g, seeded())
+    let far = entry_record(nvfsvol.chain_entry("big", 99, 976))
+    var d = ram(g)
+    install(d, 0, meta_block([root, far], prog, g.block_size, 1))
+
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("the open answers a handle; the read refuses to follow the head")
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, seeded(), NvfsOpen("/big", false)), 64)
+            test.assert(is_done(o))
+            let h = handle_of(o)
+            test.assert(h >= 0)
+            let rd = drive(d, nvfsop.begin_next(o.machine, NvfsReadFile(h, 8)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+
+@test
+fn test_a_handle_past_the_table_is_refused_before_the_device_is_asked() [io]
+    let g = small_geometry()
+    var d = ram(g)
+    let f = drive(d, nvfsop.begin(g, seeded(), NvfsFormat), 64)
+    test.assert(is_done(f))
+
+    test.case("a handle no machine issued is not open, and has no position")
+    test.assert(not nvfsop.handle_is_open(f.machine, 7))
+    test.assert(nvfsop.handle_position(f.machine, 7) == -1)
+
+    test.case("reading through it is NotFound, and asks the device for nothing")
+    let reads_before = d.reads
+    let r = drive(d, nvfsop.begin_next(f.machine, NvfsReadFile(7, 16)), 8)
+    test.assert(failed_with(r, NvfsNotFound))
+    test.assert(d.reads == reads_before)
+
+    test.case("and a machine that is already mounted refuses to mount again")
+    let q = nvfsop.begin_next(f.machine, NvfsMount)
+    test.assert(failed_with(q, NvfsNotSupported))
+
+// ---------------------------------------------------------------------------
+// 3. Blocks and bytes.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_a_block_offset_and_a_byte_offset_are_different_numbers() [io]
+    test.case("32 blocks put six pointer slots in front of every payload")
+    test.assert(nvfsctz.pointer_count(32) == 6)
+    test.assert(nvfsctz.data_offset(32) == 24)
+    test.assert(nvfsctz.capacity(512, 32) == 488)
+
+    test.case("a smaller device has fewer slots, so the SAME byte is a different offset")
+    test.assert(nvfsctz.pointer_count(4) == 3)
+    test.assert(nvfsctz.data_offset(4) == 12)
+    test.assert(nvfsctz.capacity(512, 4) == 500)
+
+    test.case("byte 1000 of a chain: block 2 of 488-byte blocks, 24 bytes into it")
+    test.assert(nvfsctz.block_count_for(1000, 488) == 3)
+    test.assert(nvfsctz.index_of_offset(1000, 488) == 2)
+    test.assert(nvfsctz.offset_in_block(1000, 488) == 24)
+    test.assert(nvfsctz.last_index(1000, 488) == 2)
+    test.assert(nvfsctz.pointer_offset(2) == 8)
+
+@test
+fn test_a_chain_read_lands_in_the_payload_and_not_on_a_pointer_slot() [io]
+    let g = small_geometry()
+    let prog = g.prog_size
+    let cap = nvfsctz.capacity(g.block_size, g.block_count)
+    let size = cap * 2
+    let root = superblock_of(g, seeded())
+    let big = entry_record(nvfsvol.chain_entry("big", 5, size))
+    var d = ram(g)
+    install(d, 0, meta_block([root, big], prog, g.block_size, 1))
+    install(d, 4, chain_data_block(g, -1, 65))
+    install(d, 5, chain_data_block(g, 4, 66))
+
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(is_done(v))
+    var machine = v.machine
+    var handle = -1
+    match nvfsop.volume(machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, seeded(), NvfsOpen("/big", false)), 64)
+            test.assert(is_done(o))
+            handle = handle_of(o)
+            machine = o.machine
+    test.assert(handle >= 0)
+    test.assert(nvfsop.handle_position(machine, handle) == 0)
+
+    test.case("byte 0 of the file is byte 24 of the block, and it is payload")
+    let a = drive(d, nvfsop.begin_next(machine, NvfsReadFile(handle, 8)), 64)
+    test.assert(bytes.to_str(data_of(a)) == "AAAAAAAA")
+    test.assert((bytes.byte_at(d.data, block_at(d, 4)) ?? 0) == nvfsgeo.erased_byte())
+    test.assert((bytes.byte_at(d.data, block_at(d, 4)
+                               + nvfsctz.data_offset(g.block_count)) ?? 0) == 65)
+
+    test.case("byte 488 of the file is the NEXT block's payload, past its pointer")
+    // The jump from the head (index 1) to the block before it (index 0)
+    // is the chain walk, and the pointer it follows lives in the slot
+    // the read must not return.
+    let b = drive(d, nvfsop.begin_next(a.machine, NvfsSeek(handle, cap, 0)), 64)
+    test.assert(is_done(b))
+    test.assert(nvfsop.handle_position(b.machine, handle) == cap)
+    let c = drive(d, nvfsop.begin_next(b.machine, NvfsReadFile(handle, 8)), 64)
+    test.assert(bytes.to_str(data_of(c)) == "BBBBBBBB")
+    test.assert((bytes.u32_le_at(d.data, block_at(d, 5)) ?? 0) == 4)
+    test.assert((bytes.byte_at(d.data, block_at(d, 5)
+                               + nvfsctz.data_offset(g.block_count)) ?? 0) == 66)
+
+    test.case("a read is capped by the BLOCK, not by the bytes asked for")
+    let s = drive(d, nvfsop.begin_next(c.machine, NvfsSeek(handle, 480, 0)), 64)
+    test.assert(is_done(s))
+    let t = drive(d, nvfsop.begin_next(s.machine, NvfsReadFile(handle, 20)), 64)
+    let got = data_of(t)
+    test.assert(bytes.len(got) == 8)
+    test.assert(bytes.to_str(got) == "AAAAAAAA")
+    test.assert(nvfsop.handle_position(t.machine, handle) == cap)
+
+    test.case("through all of it, not one program wrote a byte twice")
+    test.assert(d.programmed_twice == 0)
+    test.assert(d.oob_reads == 0)
+
+@test
+fn test_a_chain_that_does_not_reach_the_byte_is_corrupt_not_short() [io]
+    let g = small_geometry()
+    let prog = g.prog_size
+    let cap = nvfsctz.capacity(g.block_size, g.block_count)
+    let root = superblock_of(g, seeded())
+    let big = entry_record(nvfsvol.chain_entry("big", 5, cap * 2))
+    var d = ram(g)
+    install(d, 0, meta_block([root, big], prog, g.block_size, 1))
+    install(d, 4, chain_data_block(g, -1, 65))
+
+    test.case("a head whose slot for the block before it is still erased")
+    install(d, 5, chain_data_block(g, -1, 66))
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, seeded(), NvfsOpen("/big", false)), 64)
+            let rd = drive(d, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+
+    test.case("and a slot pointing past the device, refused before it is read")
+    install(d, 5, chain_data_block(g, 999, 66))
+    let v2 = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    match nvfsop.volume(v2.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let o = drive(d, nvfsop.begin_on(vol, seeded(), NvfsOpen("/big", false)), 64)
+            let rd = drive(d, nvfsop.begin_next(o.machine, NvfsReadFile(handle_of(o), 4)), 64)
+            test.assert(failed_with(rd, NvfsCorrupt))
+    test.assert(d.oob_reads == 0)
+
+// ---------------------------------------------------------------------------
+// 4. Free space, against an image that disagrees with the device.
+// ---------------------------------------------------------------------------
+
+@test
+fn test_a_mount_refuses_an_image_built_for_another_device() [io]
+    let g = small_geometry()
+
+    test.case("an image of 64 blocks on a 32-block device")
+    let wide = nvfsvol.geometry(16, 16, 512, 64)
+    var d = ram(g)
+    install(d, 0, meta_block([superblock_of(wide, seeded())], g.prog_size, g.block_size, 1))
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(failed_with(v, NvfsGeometryMismatch))
+
+    test.case("and the other direction: 12 blocks on the same device")
+    let narrow = nvfsvol.geometry(16, 16, 512, 12)
+    var e = ram(g)
+    install(e, 0, meta_block([superblock_of(narrow, seeded())], g.prog_size, g.block_size, 1))
+    let w = drive(e, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(failed_with(w, NvfsGeometryMismatch))
+
+    test.case("a 512-byte-block image on a 256-byte-block device")
+    let fine = nvfsvol.geometry(16, 16, 256, 32)
+    var f = ram(g)
+    install(f, 0, meta_block([superblock_of(fine, seeded())], 16, g.block_size, 1))
+    let x = drive(f, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(failed_with(x, NvfsGeometryMismatch))
+
+@test
+fn test_a_check_reports_a_superblock_the_device_contradicts() [io]
+    let g = small_geometry()
+    let count = g.block_count
+    let root = superblock_of(g, seeded())
+    var d = ram(g)
+    install(d, 0, meta_block([root], g.prog_size, g.block_size, 1))
+    let v = drive(d, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(is_done(v))
+
+    test.case("a clean volume: the identity holds and nothing is reported")
+    match nvfsop.volume(v.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let c = drive(d, nvfsop.begin_on(vol, seeded(), NvfsCheck), 256)
+            test.assert(is_done(c))
+            let rep = report_of(c)
+            test.assert(nvfsop.report_is_clean(rep))
+            test.assert(rep.blocks_used == 1)
+            test.assert(rep.blocks_used + rep.blocks_free == count)
+            test.assert(rep.files == 0)
+            test.assert(rep.directories == 0)
+
+    test.case("a volume whose superblock says 64 blocks on this 32-block device")
+    // The check is handed an image whose OWN superblock record says 64
+    // blocks, on a device that has 32, which is exactly the
+    // disagreement a copy of an image on the wrong part produces.  A
+    // mount refuses it; a check must report it, because the report is
+    // what a user reads before deciding what to do.
+    let wide = nvfsvol.geometry(16, 16, 512, 64)
+    let lying = nvfsvol.volume(g, nvfsvol.superblock(nvfsgeo.format_version(), 512, 64,
+                                                     255, 128, 2147483647, 100),
+                                                     1, 0)
+    var w = ram(g)
+    install(w, 0, meta_block([superblock_of(wide, seeded())], g.prog_size, g.block_size, 1))
+    test.case("and a mount of that image is refused, not repaired")
+    test.assert(failed_with(drive(w, nvfsop.begin(g, seeded(), NvfsMount), 64),
+                            NvfsGeometryMismatch))
+    let c2 = drive(w, nvfsop.begin_on(lying, seeded(), NvfsCheck), 256)
+    test.assert(is_done(c2))
+    let rep2 = report_of(c2)
+    test.assert(not nvfsop.report_is_clean(rep2))
+    test.assert(rep2.blocks_used == 1)
+    // The DEVICE's count, not the image's: the accounting is by
+    // construction over the blocks that are really there.
+    test.assert(rep2.blocks_used + rep2.blocks_free == count)
+    test.assert(rep2.blocks_free == count - 1)
+
+    test.case("the same pass over a device whose image was damaged after the fact")
+    var e = ram(g)
+    install(e, 0, meta_block([root], g.prog_size, g.block_size, 1))
+    install(e, 4, chain_data_block(g, -1, 65))
+    install(e, 5, chain_data_block(g, 4, 66))
+    let v3 = drive(e, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    match nvfsop.volume(v3.machine)
+        None      => test.assert(false)
+        Some(vol) =>
+            let clean = drive(e, nvfsop.begin_on(vol, seeded(), NvfsCheck), 256)
+            test.assert(is_done(clean))
+            let rep3 = report_of(clean)
+            test.assert(nvfsop.report_is_clean(rep3))
+            test.assert(rep3.blocks_used == 3)
+            test.assert(rep3.blocks_used + rep3.blocks_free == count)
+    // One bit in the root block's log, which is the damage a failing
+    // cell produces: a block that no longer holds a sealed superblock
+    // cannot be mounted at all, which is why this check runs on the
+    // volume a mount WOULD have answered, built here by hand — the walk
+    // over the bytes is what a user has left, and it must still add up.
+    var torn = ram(g)
+    install(torn, 0, flip_low_bit(meta_block([root], g.prog_size, g.block_size, 1),
+                                  nvfsgeo.meta_offset(g.prog_size) + 12))
+    install(torn, 4, chain_data_block(g, -1, 65))
+    install(torn, 5, chain_data_block(g, 4, 66))
+    let v4 = drive(torn, nvfsop.begin(g, seeded(), NvfsMount), 64)
+    test.assert(not is_done(v4))
+    let hurt = nvfsvol.volume(g, nvfsvol.superblock(nvfsgeo.format_version(), 512, 32,
+                                                    255, 128, 2147483647, 100),
+                                                    1, 0)
+    let c4 = drive(torn, nvfsop.begin_on(hurt, seeded(), NvfsCheck), 256)
+    test.assert(is_done(c4))
+    let rep4 = report_of(c4)
+    test.assert(not nvfsop.report_is_clean(rep4))
+    test.assert(rep4.blocks_used == 3)
+    test.assert(rep4.blocks_used + rep4.blocks_free == count)
+    test.assert(torn.oob_reads == 0)

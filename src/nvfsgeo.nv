@@ -1,7 +1,5 @@
 // nvfsgeo.nv — the geometry a volume was formatted for, as arithmetic.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS PART OF THE DEVICE CLAIM, with `nvfsctz` and
 // `nvfswear`.  Every function takes integers and answers integers, no
 // type here owns a buffer, and nothing calls anything outside the
@@ -74,6 +72,17 @@ pub enum NvfsError
     // littlefs's global move state.
     NvfsNotSupported
 
+// The length of the superblock payload `nvfsvol.encode_superblock`
+// builds — magic, version, geometry and the bounds, eight four-byte
+// words — which is what a block must be able to hold one record of.
+//
+// Private because it is not a fact a caller acts on: a caller asks
+// `check_geometry` whether its geometry carries a filesystem, and this
+// is only what that question is made of.
+
+fn superblock_payload_len() -> Int []
+    32
+
 // `NvfsError` is an `Error`, which is what lets
 // `Result<T, NvfsError>` exist at all — `nvfsvol.decode_superblock`
 // is the one signature in this package that answers a `Result`
@@ -84,10 +93,8 @@ impl Error for NvfsError
     // `NvfsOk` is an arm of this enum because it is the zero of the
     // error set rather than a separate success type, so its message
     // says that nothing went wrong rather than naming a fault.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("nvfs-core.NvfsError.message")
+        error_name(self)
 
 // The error's own name, for a message or a log line.
 //
@@ -98,7 +105,22 @@ impl Error for NvfsError
 //     println(nvfsgeo.error_name(NvfsNoSpace))
 // ```
 pub fn error_name(e: NvfsError) -> Str []
-    todo("nvfs-core.nvfsgeo.error_name")
+    match e
+        NvfsOk                 => "ok"
+        NvfsIoFailed           => "i/o failed"
+        NvfsCorrupt            => "corrupt"
+        NvfsNoFilesystem       => "no filesystem"
+        NvfsGeometryMismatch   => "geometry mismatch"
+        NvfsVersionUnsupported => "version unsupported"
+        NvfsInvalidConfig      => "invalid configuration"
+        NvfsNoSpace            => "no space"
+        NvfsNotFound           => "not found"
+        NvfsExists             => "already exists"
+        NvfsNotDirectory       => "not a directory"
+        NvfsIsDirectory        => "is a directory"
+        NvfsNotEmpty           => "not empty"
+        NvfsNameTooLong        => "name too long"
+        NvfsNotSupported       => "not supported"
 
 // Whether an error is the absence of a filesystem rather than damage
 // to one.
@@ -114,7 +136,9 @@ pub fn error_name(e: NvfsError) -> Str []
 //     println("${nvfsgeo.is_blank(NvfsNoFilesystem)}")
 // ```
 pub fn is_blank(e: NvfsError) -> Bool []
-    todo("nvfs-core.nvfsgeo.is_blank")
+    match e
+        NvfsNoFilesystem => true
+        _                => false
 
 // The byte an erased NOR cell reads as.
 //
@@ -129,7 +153,7 @@ pub fn is_blank(e: NvfsError) -> Bool []
 //     println("${nvfsgeo.erased_byte()}")
 // ```
 pub fn erased_byte() -> Int []
-    todo("nvfs-core.nvfsgeo.erased_byte")
+    255
 
 // The 32-bit word an erased revision field reads as.
 //
@@ -140,7 +164,7 @@ pub fn erased_byte() -> Int []
 //     println("${nvfsgeo.erased_word()}")
 // ```
 pub fn erased_word() -> Int []
-    todo("nvfs-core.nvfsgeo.erased_word")
+    4294967295
 
 // The record type nothing may ever use.
 //
@@ -157,7 +181,7 @@ pub fn erased_word() -> Int []
 //     println("${nvfsgeo.reserved_record_type()}")
 // ```
 pub fn reserved_record_type() -> Int []
-    todo("nvfs-core.nvfsgeo.reserved_record_type")
+    erased_byte()
 
 // The on-disk format version this library writes.
 //
@@ -172,7 +196,9 @@ pub fn reserved_record_type() -> Int []
 //     println("${nvfsgeo.format_version()}")
 // ```
 pub fn format_version() -> Int []
-    todo("nvfs-core.nvfsgeo.format_version")
+    // Major 1 in the high half and minor 0 in the low, which is the
+    // first shape of the format.
+    (1 << 16) | 0
 
 // Whether an on-disk version is one this library can mount.
 //
@@ -183,7 +209,7 @@ pub fn format_version() -> Int []
 //     println("${nvfsgeo.version_is_mountable(nvfsgeo.format_version())}")
 // ```
 pub fn version_is_mountable(version: Int) -> Bool []
-    todo("nvfs-core.nvfsgeo.version_is_mountable")
+    (version >>> 16) == (format_version() >>> 16)
 
 // Byte `index` of the four-byte superblock magic.
 //
@@ -198,7 +224,14 @@ pub fn version_is_mountable(version: Int) -> Bool []
 //     println("${nvfsgeo.magic_byte(0)}")
 // ```
 pub fn magic_byte(index: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.magic_byte")
+    // "nvfs", one byte at a time.  None of the four is 0xFF, so an
+    // erased block cannot spell the magic, and no two are equal.
+    match index
+        0 => 'n'
+        1 => 'v'
+        2 => 'f'
+        3 => 's'
+        _ => 0
 
 // Where a metadata block's records start: `max(4, prog_size)`.
 //
@@ -215,7 +248,10 @@ pub fn magic_byte(index: Int) -> Int []
 //     println("${nvfsgeo.meta_offset(1)}")       // 4
 // ```
 pub fn meta_offset(prog_size: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.meta_offset")
+    if prog_size < 4
+        4
+    else
+        prog_size
 
 // `n` rounded up to a multiple of `alignment`.
 //
@@ -226,7 +262,14 @@ pub fn meta_offset(prog_size: Int) -> Int []
 //     println("${nvfsgeo.align_up(9, 4)}")       // 12
 // ```
 pub fn align_up(n: Int, alignment: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.align_up")
+    // An alignment of zero or less has no multiples to round to, and
+    // the division would be by zero; the input is answered unchanged
+    // rather than panicking, because this is called with a geometry
+    // the caller supplied.
+    if alignment <= 0
+        n
+    else
+        (n + alignment - 1) / alignment * alignment
 
 // How many bytes a record with this payload occupies on disk, before
 // padding: four of header, the payload, four of CRC.
@@ -238,7 +281,12 @@ pub fn align_up(n: Int, alignment: Int) -> Int []
 //     println("${nvfsgeo.record_size(32)}")      // 40
 // ```
 pub fn record_size(payload_len: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.record_size")
+    // A negative length is not a length; the header and the CRC are
+    // still there, so that is what it costs.
+    if payload_len < 0
+        8
+    else
+        payload_len + 8
 
 // How many bytes it occupies after padding to a prog page, which is
 // what an append actually costs.
@@ -250,7 +298,7 @@ pub fn record_size(payload_len: Int) -> Int []
 //     println("${nvfsgeo.record_span(32, 16)}")  // 48
 // ```
 pub fn record_span(payload_len: Int, prog_size: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.record_span")
+    align_up(record_size(payload_len), prog_size)
 
 // The largest payload a record may carry in a block of this size.
 //
@@ -265,7 +313,15 @@ pub fn record_span(payload_len: Int, prog_size: Int) -> Int []
 //     println("${nvfsgeo.max_payload(4096, 256)}")
 // ```
 pub fn max_payload(block_size: Int, prog_size: Int) -> Int []
-    todo("nvfs-core.nvfsgeo.max_payload")
+    // `append_fits` is strict about the block's tail, so the payload
+    // is bounded by the block less the revision page, less one prog
+    // page of tail, less the record's own header and CRC.  A block
+    // this small carries nothing, and zero is the honest bound.
+    let room = block_size - meta_offset(prog_size) - prog_size - record_size(0)
+    if room < 0
+        0
+    else
+        room
 
 // Whether one more record of this payload fits after `end_offset`.
 //
@@ -279,7 +335,11 @@ pub fn max_payload(block_size: Int, prog_size: Int) -> Int []
 //     println("${nvfsgeo.append_fits(4096, 256, 512, 32)}")
 // ```
 pub fn append_fits(block_size: Int, prog_size: Int, end_offset: Int, payload_len: Int) -> Bool []
-    todo("nvfs-core.nvfsgeo.append_fits")
+    // Strict, not `<=`: a record whose padded span ends exactly at the
+    // block's last byte is refused, because the block's tail is where
+    // the next append's padding goes.  `max_payload` subtracts the
+    // same page for the same reason, so the two cannot disagree.
+    end_offset + record_span(payload_len, prog_size) < block_size
 
 // Whether a read or program of `len` bytes at `off` in a block is
 // aligned and in range.
@@ -296,7 +356,18 @@ pub fn append_fits(block_size: Int, prog_size: Int, end_offset: Int, payload_len
 //     println("${nvfsgeo.access_is_valid(4096, 16, 0, 16)}")
 // ```
 pub fn access_is_valid(block_size: Int, unit: Int, off: Int, len: Int) -> Bool []
-    todo("nvfs-core.nvfsgeo.access_is_valid")
+    // A filesystem image is untrusted input, so every one of these is
+    // asked before the arithmetic that would need it: a unit of zero
+    // is a division by zero, a negative offset is a read before the
+    // block, and a negative length is a read of the wrong size.
+    if unit <= 0 or block_size <= 0
+        false
+    elif off < 0 or len < 0
+        false
+    elif off % unit != 0 or len % unit != 0
+        false
+    else
+        off + len <= block_size
 
 // The first block of the superblock pair, which is also the root
 // directory's.
@@ -311,7 +382,7 @@ pub fn access_is_valid(block_size: Int, unit: Int, off: Int, len: Int) -> Bool [
 //     println("${nvfsgeo.root_pair_first()}")
 // ```
 pub fn root_pair_first() -> Int []
-    todo("nvfs-core.nvfsgeo.root_pair_first")
+    0
 
 // The second block of the superblock pair.
 //
@@ -322,7 +393,7 @@ pub fn root_pair_first() -> Int []
 //     println("${nvfsgeo.root_pair_second()}")
 // ```
 pub fn root_pair_second() -> Int []
-    todo("nvfs-core.nvfsgeo.root_pair_second")
+    1
 
 // Whether a block number is one a metadata pair or a file may be
 // allocated on.
@@ -336,7 +407,11 @@ pub fn root_pair_second() -> Int []
 //     println("${nvfsgeo.block_is_allocatable(2, 16)}")
 // ```
 pub fn block_is_allocatable(block: Int, block_count: Int) -> Bool []
-    todo("nvfs-core.nvfsgeo.block_is_allocatable")
+    // The device is untrusted: a block number past the end of it is
+    // not allocatable, and neither is one of the two the root pair
+    // holds.  The second is written as a literal because the root is
+    // anchored at 0 here rather than derived.
+    block >= 2 and block < block_count
 
 // Whether a geometry can carry a filesystem at all, and which error to
 // answer when it cannot.
@@ -354,4 +429,13 @@ pub fn block_is_allocatable(block: Int, block_count: Int) -> Bool []
 // ```
 pub fn check_geometry(read_size: Int, prog_size: Int, block_size: Int,
                       block_count: Int) -> NvfsError []
-    todo("nvfs-core.nvfsgeo.check_geometry")
+    let first_record = meta_offset(prog_size)
+        + record_span(superblock_payload_len(), prog_size)
+    if read_size < 1 or prog_size < 1 or block_size < 1 or block_count < 2
+        NvfsInvalidConfig
+    elif block_size % read_size != 0 or block_size % prog_size != 0
+        NvfsInvalidConfig
+    elif first_record > block_size
+        NvfsInvalidConfig
+    else
+        NvfsOk

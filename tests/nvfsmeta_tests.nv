@@ -1,9 +1,6 @@
 // nvfsmeta_tests.nv — the record log, its arbitration, and the
 // commit-and-seal cycle.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: nvfs-core.nvfsmeta.<fn>`.
-//
 // THE SANS-IO SHAPE IS WHAT MAKES THIS SUITE POSSIBLE.  `scan_block`
 // takes the block's BYTES, so every power-loss case is a byte array:
 // an erased block, a block whose records are programmed and whose
@@ -52,10 +49,10 @@ fn test_the_checksum_is_crc_32c_and_the_published_check_value_says_so() [io]
 fn test_an_erased_block_is_not_a_filesystem_and_is_not_damage() [io]
     test.case("an erased block has no sealed revision")
     let s = nvfsmeta.scan_block(256, 4096, erased_block(4096))
-    test.assert(nvfsmeta.scan_valid(s) == false)
+    test.assert(not nvfsmeta.scan_valid(s))
 
     test.case("and is not torn — nothing was half written")
-    test.assert(nvfsmeta.scan_torn(s) == false)
+    test.assert(not nvfsmeta.scan_torn(s))
 
     test.case("so a pair of them is blank rather than corrupt")
     test.assert(nvfsmeta.pair_is_blank(s, s))
@@ -84,7 +81,7 @@ fn test_arbitration_is_the_pair_rule_applied_to_two_scans() [io]
     test.case("a pair of erased blocks arbitrates to nothing")
     let s = nvfsmeta.scan_block(256, 4096, erased_block(4096))
     let state = nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s, s)
-    test.assert(state.ok == false)
+    test.assert(not state.ok)
 
     test.case("and the pair remembers which blocks it was")
     test.assert(nvfsmeta.pair(0, 1).first == 0)
@@ -137,4 +134,36 @@ fn test_a_compaction_is_refused_before_anything_is_erased() [io]
     test.assert(nvfsmeta.compaction_fits([], 16, 4096))
 
     test.case("a set larger than the block is not")
-    test.assert(nvfsmeta.compaction_fits([nvfsmeta.record(2, bytes.zeros(8192))], 16, 4096) == false)
+    test.assert(not nvfsmeta.compaction_fits([nvfsmeta.record(2, bytes.zeros(8192))], 16, 4096))
+
+@test
+fn test_the_second_block_wins_when_its_revision_is_the_higher_one() [io]
+    // Both orders, because the answer names PHYSICAL blocks: a rule
+    // that always picked the first block would agree with every case a
+    // fresh format produces, and disagree with the device where a
+    // compaction has already flipped the pair.
+    var earlier = erased_block(4096)
+    bytes.set_u32_le(earlier, 0, 3)
+    var later = erased_block(4096)
+    bytes.set_u32_le(later, 0, 4)
+    let s1 = nvfsmeta.scan_block(256, 4096, earlier)
+    let s2 = nvfsmeta.scan_block(256, 4096, later)
+
+    test.case("both blocks are sealed, and their revisions are the ones programmed")
+    test.assert(nvfsmeta.scan_valid(s1))
+    test.assert(nvfsmeta.scan_revision(s1) == 3)
+    test.assert(nvfsmeta.scan_revision(s2) == 4)
+
+    test.case("so the pair's active block is the second, and its scan is the second's")
+    let state = nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s1, s2)
+    test.assert(state.ok)
+    test.assert(state.active == 1)
+    test.assert(state.sibling == 0)
+    test.assert(nvfsmeta.scan_revision(state.scan) == 4)
+
+    test.case("whichever way round the two scans were handed to it")
+    let flipped = nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s2, s1)
+    test.assert(flipped.ok)
+    test.assert(flipped.active == 0)
+    test.assert(flipped.sibling == 1)
+    test.assert(nvfsmeta.scan_revision(flipped.scan) == 4)

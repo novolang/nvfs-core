@@ -1,20 +1,17 @@
 [package]
 name        = "nvfs-core"
-version     = "0.0.3"
-description = "A littlefs-class filesystem with no device attached: the superblock, the metadata pairs and their commit-and-seal cycle, the CTZ skip-list, the directory entries, and every operation from mount to fsck as a state machine that ANSWERS the block reads and writes a host must perform.  littlefs's four lfs_config callbacks turned into a value, so the format is exercised against a byte array and a power cut is a test that stops feeding answers.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "A littlefs-class filesystem with no device attached: the superblock, the metadata pairs and their commit-and-seal cycle, the CTZ skip-list, the directory entries, and every operation from mount to fsck as a state machine that ANSWERS the block reads and writes a host must perform.  littlefs's four lfs_config callbacks turned into a value, so the format is exercised against a byte array and a power cut is a test that stops feeding answers."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`: arithmetic over block numbers, offsets and bytes the caller
 # already holds.  Nothing here reads or programs a page — the machine
 # returns the action and the host performs it — so no function declares
-# an effect, and three of the six modules build for a Cortex-M.
+# an effect, and the whole package builds for a Cortex-M: three modules
+# by allocating nothing, and the other three by saying `@tier(app)` on
+# every function, which is what a device build needs to be told.
 layer       = "core"
 
 category    = "embedded"
@@ -22,7 +19,7 @@ category    = "embedded"
 tags        = ["littlefs", "filesystem", "flash", "nor", "wear-levelling", "power-loss", "embedded", "sans-io", "dogfood"]
 repository  = "https://github.com/novolang/nvfs-core"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
@@ -42,9 +39,11 @@ novo        = ">= 0.8.9"
 # can be summed as it is built.  Two implementations of one polynomial
 # in one registry is the thing worth avoiding.
 #
-# It is named only by `nvfsmeta`, which is not in the device probe.
-# The three modules that ARE — `nvfsgeo`, `nvfsctz`, `nvfswear` — name
-# nothing outside the language.
+# It is named only by `nvfsmeta`, which is not what the device probe
+# calls: `nvfsmeta` allocates by construction, so every function of it
+# carries `@tier(app)` and a device build checks it at that tier.  The
+# three modules the probe does call — `nvfsgeo`, `nvfsctz`, `nvfswear`
+# — name nothing outside the language.
 #
 # No collection package.  The device half of this package is integers
 # in the caller's own stack frame.  The buffers a firmware needs, the

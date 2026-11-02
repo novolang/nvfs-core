@@ -8,11 +8,6 @@ is the reference. It performs no input or output: it **answers** the block
 reads and writes a caller must perform, and the caller performs them. It is
 built on [crc-nv](https://novo-lang.org/packages/crc-nv).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it
-is implemented. Version 0.1.0 will be the first working release.
-
 ## What it is
 
 NOR flash has three properties that decide the whole design. A write can
@@ -105,9 +100,10 @@ fn main() [io]
                 running = false
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test` fails
-on purpose: every test reaches a `not implemented` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. Neither command needs
+a device: every block read the machine asks for is answered out of a byte
+array the test built by hand, which is the whole reason the four callbacks
+are values here.
 
 ## What the package contains
 
@@ -183,12 +179,19 @@ to instantiate.
 ## Running on a microcontroller
 
 The package states that its modules run on a device with no heap allocator,
-and the compiler checks that claim on every build. Here it covers `nvfsgeo`,
-`nvfsctz` and `nvfswear`: the layout arithmetic, the skip-list walk, and the
-wear and arbitration rules. Between them they own two `@value` structs of
-three integers each and no other type at all. Those three are what a firmware
-runs in a loop: seek into a file, decide whether a commit fits, pick a free
-block, choose between the two blocks of a pair.
+and the compiler checks that claim on every build. The whole package builds
+for a Cortex-M: a device build compiles every module under `src/`, and the
+three that allocate say so — every function of `nvfsmeta`, `nvfsvol` and
+`nvfsop` carries `@tier(app)`, so a device build checks them at the
+application tier and emits none of them, because the probe never reaches
+them.
+
+The runtime claim is narrower, and it is the interesting half: `nvfsgeo`,
+`nvfsctz` and `nvfswear` — the layout arithmetic, the skip-list walk, and the
+wear and arbitration rules — allocate nothing at all. Between them they own
+two `@value` structs of three integers each and no other type at all. Those
+three are what a firmware runs in a loop: seek into a file, decide whether a
+commit fits, pick a free block, choose between the two blocks of a pair.
 
 `tests/embedded_probe.nv` is that claim as a program that either builds or
 does not.
@@ -198,23 +201,32 @@ novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
 The command produces a Cortex-M4 executable, `embedded_probe.elf`. The probe
-builds and is not run, because every function it calls is a `todo()` that
-would panic on the first line.
+builds and is not run: a device build is a compile and not a run, and what it
+proves is a property of the surface — that no allocator, no operating system
+and no buffer-owning type appears in the closure of the three modules it
+calls. What `score` in the probe calls is the implemented walk and not a stub.
 
-`nvfsmeta`, `nvfsvol` and `nvfsop` are outside the claim. A record holds
-`Bytes`, a directory fold builds a list of entries, and an action's payload
-is a buffer. Every one of those allocates by construction.
+A build of a file under `tests/` resolves this package's `src/` but not its
+dependencies, so the route that checks the whole package — all six modules
+and `crc-nv` with them — stages the probe under `src/`:
 
-The registry lists all six modules at every tier, the embedded tier
-included. Its tier check admits a module that allocates, because a device
-program has a heap of fixed size. The claim in this section is narrower:
-`nvfsgeo`, `nvfsctz` and `nvfswear` allocate nothing at all.
+```bash
+cp tests/embedded_probe.nv src/zz_probe_tmp.nv
+novo build --target=nrf52-qemu src/zz_probe_tmp.nv
+rm src/zz_probe_tmp.nv
+```
 
-What the probe checks in this release is narrower than what it will check.
-Every body is a `todo()`, so what links today is the signatures and the
-types: nothing in the shape of the surface needs an allocator or an operating
-system. It does not yet prove that a seek allocates nothing. Keeping it
-building once the bodies land is a cost of the implementation step.
+That is the route the package is verified on, and it is the one that fails if
+a host-face module loses its `@tier(app)` annotation: an unannotated function
+is checked as if it were device code, fail-closed.
+
+What the probe checks is narrower than its name suggests, and saying so is
+more useful than pretending otherwise. It calls the implemented functions and
+folds every answer into one number, so a device that disagrees with the host
+says how many checks it lost — but it proves that nothing in the closure of
+those three modules needs an allocator or an operating system, not that a
+seek at run time is allocation-free on the part. What runs is the host suite,
+against the same functions.
 
 ## What is not included
 
@@ -251,13 +263,14 @@ building once the bodies land is a cost of the implementation step.
 ## Tests
 
 ```bash
-novo test                             # 60 tests
-novo test tests/nvfsgeo_tests.nv      # 11: the layout arithmetic
-novo test tests/nvfsctz_tests.nv      #  8: the skip-list and the seek
-novo test tests/nvfswear_tests.nv     # 10: arbitration, allocation, the power-loss rules
-novo test tests/nvfsmeta_tests.nv     #  8: the record log and the commit cycle
-novo test tests/nvfsvol_tests.nv      # 12: the superblock, the entries, the fold
-novo test tests/nvfsop_tests.nv       # 11: a format and a mount, driven to completion
+novo test                                 # 71 tests
+novo test tests/nvfsgeo_tests.nv          # 11: the layout arithmetic
+novo test tests/nvfsctz_tests.nv          #  8: the skip-list and the seek
+novo test tests/nvfswear_tests.nv         # 10: arbitration, allocation, the power-loss rules
+novo test tests/nvfsmeta_tests.nv         #  8: the record log and the commit cycle
+novo test tests/nvfsvol_tests.nv          # 12: the superblock, the entries, the fold
+novo test tests/nvfsop_tests.nv           # 11: a format and a mount, driven to completion
+novo test tests/nvfs_core_edge_tests.nv   # 11: the CRC on damage, the bounds, the two offset units, free space
 ```
 
 littlefs's `DESIGN.md` is the specification for the metadata pair, the
@@ -267,24 +280,12 @@ actions invert.
 No test opens a device. Every read is answered out of a byte array the test
 built by hand, and the device in `tests/nvfsop_tests.nv` is a `while` loop.
 
-The tests compile today and fail at run, each on the `not implemented` panic
-that is its body. That is the expected state of an interface release. They
-turn green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `nvfsgeo.NvfsError`, `nvfsctz.NvfsCtzWalk`, `nvfswear.NvfsAlloc` | declared |
-| `nvfsmeta.NvfsRecord`, `.NvfsScan`, `.NvfsPair`, `.NvfsPairState` | declared |
-| `nvfsvol.NvfsGeometry`, `.NvfsConfig`, `.NvfsVolume`, `.NvfsSuperblock`, `.NvfsEntryKind`, `.NvfsEntry` | declared |
-| `nvfsop.NvfsAction`, `.NvfsAnswer`, `.NvfsOp`, `.NvfsResult`, `.NvfsReport`, `.NvfsStep`, `.NvfsProgress`, `.NvfsMachine` | declared |
-| `nvfsgeo`: the layout arithmetic and the geometry check | no |
-| `nvfsctz`: the pointer arithmetic, the walk and the seek | no |
-| `nvfswear`: arbitration, allocation, sealing and the wear counters | no |
-| `nvfsmeta`: the record, the scan and the three commit images | no |
-| `nvfsvol`: the superblock, the entries, the fold and the path handling | no |
-| `nvfsop`: `begin`, `resume_read`, `resume_ok` and the accessors | no |
+`tests/nvfs_core_edge_tests.nv` goes one step further and puts the bytes on a
+RAM device first: a `Bytes` of erased blocks, with a program that REFUSES to
+write a byte twice and a read that counts how often it was asked for a block
+outside the device. That counter is how "the bound was checked before the
+read" is asserted rather than hoped for, and it is the device the damaged
+images, the chain read and the free-space cases all run on.
 
 ## Licence
 

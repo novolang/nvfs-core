@@ -1,7 +1,6 @@
 // nvfsop.nv — every filesystem operation as a state machine that
 // answers the block reads and writes a host must perform.
 //
-// Every body here is a `todo()`; the signatures are the design.
 //
 // THE LOAD-BEARING INTERFACE IS `NvfsAction`, AND THE ARGUMENT FOR IT
 // IS AN INVERSION.  littlefs takes four function pointers — `read`,
@@ -56,9 +55,11 @@
 // remembers, so a host that drops a machine drops its handles, and
 // there is nothing on disk to make stale.
 
+use nvfsctz
 use nvfsgeo
 use nvfsmeta
 use nvfsvol
+use nvfswear
 
 // What the host must do next.
 //
@@ -197,28 +198,73 @@ pub struct NvfsProgress
 // be refused.  It holds the walk's three numbers and rebuilds the walk
 // per step, which costs nothing and keeps both halves of the package
 // honest about which one has the heap.
+//
+// Every field a step MOVES is `var`, and the resume family advances the
+// machine the caller handed it on rather than rebuilding a twenty-one
+// field literal per step.  The fields past `volume` are the ones a step
+// needs and no signature carries:
+//
+//   * `first_scan` is the pair's first block, scanned, held for the
+//     arbitration the second read finishes: arbitration needs both
+//     scans and the machine has room for one image at a time.
+//   * `pending` is the record body the operation is committing — a
+//     tombstone's name, a rename's two names, or a file's whole new
+//     contents.  It is built where the directory's entries are in hand
+//     and programmed two or three steps later, and for an inline file
+//     its bytes exist nowhere else.
+//   * `staged` is the image `pending` became: an append image or a
+//     compaction image, which is what the program carries.  The payload
+//     and the image are separate fields because the first decides
+//     between the two and the second is what goes on the wire.
+//   * `handles` and `paths` are the handle table — flat id/position
+//     pairs, and one path per handle in the same order — and
+//     `next_handle` is the next id.  A handle is a number the machine
+//     remembers and nothing on disk, so the table has to live
+//     somewhere, and a machine with nowhere to put it could not answer
+//     `handle_is_open` at all.
+//   * `read_to` is where a chain read stops: the entry's size, or the
+//     cursor plus the length asked for, whichever is smaller.
+//   * `attempts` counts the erases one phase has asked for again, so a
+//     failed erase retries a bounded number of times.
+//   * `problems` and `directories` are two of the tallies a check's
+//     report carries, accumulated as the pass goes.
 pub struct NvfsMachine
     geometry: nvfsvol.NvfsGeometry
     config: nvfsvol.NvfsConfig
-    op: NvfsOp
+    // Which operation is in flight.  `var` because `begin_next` puts a
+    // finished machine to work on the next one, keeping its handles.
+    var op: NvfsOp
     // Where the operation is in its own sequence.  Opaque to a caller
     // and readable so a test can assert that a mount reached the
     // superblock before it asked for block 1.
-    phase: Int
+    var phase: Int
     // The metadata pair the operation is working in.
-    pair: nvfsmeta.NvfsPair
+    var pair: nvfsmeta.NvfsPair
     // The allocation cursor, carried across the operation so two
-    // allocations in one commit do not both pick the same block.
-    cursor: Int
-    // The chain walk, as its three numbers.
-    walk_block: Int
-    walk_index: Int
-    walk_target: Int
+    // allocations in one commit do not both pick the same block — and,
+    // while a compaction is in flight, the revision its seal carries.
+    var cursor: Int
+    // The chain walk, as its three numbers; and between levels of a
+    // path walk, `walk_index` is how many components have been
+    // descended.
+    var walk_block: Int
+    var walk_index: Int
+    var walk_target: Int
     // How many actions the host has performed, which is what makes
     // "cut the power at action N" an addressable test.
-    actions_taken: Int
+    var actions_taken: Int
     // The volume, once a mount has read one.
-    volume: ?nvfsvol.NvfsVolume
+    var volume: ?nvfsvol.NvfsVolume
+    var first_scan: ?nvfsmeta.NvfsScan
+    var pending: Bytes
+    var staged: Bytes
+    var handles: [Int]
+    var paths: [Str]
+    var next_handle: Int
+    var attempts: Int
+    var read_to: Int
+    var problems: [Str]
+    var directories: Int
 
 // Start an operation on a device that has not been mounted.
 //
@@ -234,8 +280,12 @@ pub struct NvfsMachine
 //     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
 //     println("${nvfsop.actions_taken(p.machine)}")
 // ```
-pub fn begin(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
-    todo("nvfs-core.nvfsop.begin")
+pub @tier(app)
+fn begin(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
+    var m = fresh(g, c, op, nvfswear.cursor_seed(0, g.block_count))
+    match nvfsvol.check_config(c, g)
+        NvfsOk => begin_fresh(var m, op)
+        e      => broken(var m, e)
 
 // Start an operation on a mounted volume.
 //
@@ -248,8 +298,41 @@ pub fn begin(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, op: NvfsOp) -> Nvfs
 //     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
 //     println("${nvfsop.actions_taken(p.machine)}")
 // ```
-pub fn begin_on(v: nvfsvol.NvfsVolume, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
-    todo("nvfs-core.nvfsop.begin_on")
+pub @tier(app)
+fn begin_on(v: nvfsvol.NvfsVolume, c: nvfsvol.NvfsConfig, op: NvfsOp) -> NvfsProgress []
+    var m = fresh(v.geometry, c, op, nvfswear.cursor_seed(v.revision, v.geometry.block_count))
+    m.volume = Some(nvfsvol.volume(v.geometry, v.superblock, v.revision, v.active))
+    begin_mounted(var m, op)
+
+// Start another operation on a machine that has already finished one.
+//
+// A handle is a number THE MACHINE remembers, so a driver that began
+// every operation with `begin_on` would drop the table each time and a
+// handle could never be used: this is the call that makes `NvfsOpen`
+// worth its interface.  The machine keeps its volume, its handle table
+// and its action count, which is also what makes a cut at action N
+// addressable across a session rather than within one operation.
+//
+// ```novo
+// use nvfsop
+// use nvfsvol
+//
+// fn main() [io]
+//     let g = nvfsvol.geometry(16, 16, 512, 32)
+//     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
+//     let q = nvfsop.begin_next(p.machine, NvfsStat("/a"))
+//     println("${nvfsop.actions_taken(q.machine)}")
+// ```
+pub @tier(app)
+fn begin_next(m: NvfsMachine, op: NvfsOp) -> NvfsProgress []
+    var local = m
+    if not is_terminal(local)
+        // An operation in flight would be abandoned mid-record, and the
+        // record it was committing is not something a second operation
+        // may overwrite.
+        broken(var local, NvfsInvalidConfig)
+    else
+        reset_op(var local, op)
 
 // Hand back the bytes a `NvfsRead` asked for, and take the next step.
 //
@@ -264,16 +347,28 @@ pub fn begin_on(v: nvfsvol.NvfsVolume, c: nvfsvol.NvfsConfig, op: NvfsOp) -> Nvf
 //     let q = nvfsop.resume_read(p.machine, bytes.zeros(512))
 //     println("${nvfsop.actions_taken(q.machine)}")
 // ```
-pub fn resume_read(m: NvfsMachine, data: Bytes) -> NvfsProgress []
-    todo("nvfs-core.nvfsop.resume_read")
+pub @tier(app)
+fn resume_read(m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    var local = m
+    match action_for(var local, local.staged)
+        None    => broken(var local, NvfsCorrupt)
+        Some(a) =>
+            if action_is_ack(a)
+                // Bytes for a program, an erase or a sync: the answer
+                // does not describe the action that was asked for.
+                broken(var local, NvfsCorrupt)
+            else
+                advance(var local, data)
 
 // Report whether a program, erase or sync worked, and take the next
 // step.
 //
-// A `false` is not always a failure: a failed erase retires the block
-// and the machine retries the allocation elsewhere, up to
-// `nvfswear.allocation_attempts` times, which is how a worn part keeps
-// working rather than becoming read-only at the first bad block.
+// A `false` is not always a failure: an erase that failed is asked for
+// again, up to `nvfswear.allocation_attempts` times, because an erase is
+// idempotent and a marginal cell often takes on a second try.  A `false`
+// for a program or a sync is `NvfsIoFailed` with no retry: a program
+// that failed may have left a half-written page, and writing that page
+// twice is the one thing NOR programming forbids.
 //
 // ```novo
 // use nvfsop
@@ -284,8 +379,28 @@ pub fn resume_read(m: NvfsMachine, data: Bytes) -> NvfsProgress []
 //     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsFormat)
 //     println("${nvfsop.actions_taken(nvfsop.resume_ok(p.machine, true).machine)}")
 // ```
-pub fn resume_ok(m: NvfsMachine, succeeded: Bool) -> NvfsProgress []
-    todo("nvfs-core.nvfsop.resume_ok")
+pub @tier(app)
+fn resume_ok(m: NvfsMachine, succeeded: Bool) -> NvfsProgress []
+    var local = m
+    match action_for(var local, local.staged)
+        None    => broken(var local, NvfsCorrupt)
+        Some(a) =>
+            if not action_is_ack(a)
+                // An acknowledgement for a read: the bytes never
+                // arrived, and reading on would scan a block the machine
+                // never saw.
+                broken(var local, NvfsCorrupt)
+            elif succeeded
+                advance(var local, bytes.zeros(0))
+            elif action_is_erase(a) and local.attempts + 1 < nvfswear.allocation_attempts()
+                // The retry is bounded and it is only for an erase:
+                // an erase is idempotent, while a program that failed
+                // may have left a half-written page that must never be
+                // written twice.
+                local.attempts = local.attempts + 1
+                needing(local, a)
+            else
+                broken(var local, NvfsIoFailed)
 
 // Hand back whichever answer the action wanted.
 //
@@ -305,8 +420,11 @@ pub fn resume_ok(m: NvfsMachine, succeeded: Bool) -> NvfsProgress []
 //     let q = nvfsop.resume(p.machine, NvfsGotBytes(bytes.zeros(512)))
 //     println("${nvfsop.actions_taken(q.machine)}")
 // ```
-pub fn resume(m: NvfsMachine, answer: NvfsAnswer) -> NvfsProgress []
-    todo("nvfs-core.nvfsop.resume")
+pub @tier(app)
+fn resume(m: NvfsMachine, answer: NvfsAnswer) -> NvfsProgress []
+    match answer
+        NvfsGotBytes(data)   => resume_read(m, data)
+        NvfsGotOk(succeeded) => resume_ok(m, succeeded)
 
 // The action a machine is waiting on, or `None` when it is not waiting.
 //
@@ -321,8 +439,13 @@ pub fn resume(m: NvfsMachine, answer: NvfsAnswer) -> NvfsProgress []
 //         None    => println("not waiting")
 //         Some(_) => println("waiting")
 // ```
-pub fn pending(m: NvfsMachine) -> ?NvfsAction []
-    todo("nvfs-core.nvfsop.pending")
+pub @tier(app)
+fn pending(m: NvfsMachine) -> ?NvfsAction []
+    // The staged image is copied because a machine the caller holds by
+    // value cannot hand its own buffer out, and the copy is one record
+    // long.
+    var local = m
+    action_for(var local, bytes.clone(local.staged))
 
 // How many actions the host has performed for this machine.
 //
@@ -337,8 +460,9 @@ pub fn pending(m: NvfsMachine) -> ?NvfsAction []
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println("${nvfsop.actions_taken(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine)}")
 // ```
-pub fn actions_taken(m: NvfsMachine) -> Int []
-    todo("nvfs-core.nvfsop.actions_taken")
+pub @tier(app)
+fn actions_taken(m: NvfsMachine) -> Int []
+    m.actions_taken
 
 // Whether an action changes the device.
 //
@@ -352,8 +476,13 @@ pub fn actions_taken(m: NvfsMachine) -> Int []
 // fn main() [io]
 //     println("${nvfsop.action_is_write(NvfsErase(3))}")
 // ```
-pub fn action_is_write(a: NvfsAction) -> Bool []
-    todo("nvfs-core.nvfsop.action_is_write")
+pub @tier(app)
+fn action_is_write(a: NvfsAction) -> Bool []
+    match a
+        NvfsRead(_, _, _) => false
+        NvfsProg(_, _, _) => true
+        NvfsErase(_)      => true
+        NvfsSync          => false
 
 // Which block an action touches, and -1 for a sync.
 //
@@ -363,8 +492,13 @@ pub fn action_is_write(a: NvfsAction) -> Bool []
 // fn main() [io]
 //     println("${nvfsop.action_block(NvfsErase(3))}")
 // ```
-pub fn action_block(a: NvfsAction) -> Int []
-    todo("nvfs-core.nvfsop.action_block")
+pub @tier(app)
+fn action_block(a: NvfsAction) -> Int []
+    match a
+        NvfsRead(block, _, _) => block
+        NvfsProg(block, _, _) => block
+        NvfsErase(block)      => block
+        NvfsSync              => 0 - 1
 
 // How many bytes an action moves, and 0 for an erase or a sync.
 //
@@ -378,8 +512,13 @@ pub fn action_block(a: NvfsAction) -> Int []
 // fn main() [io]
 //     println("${nvfsop.action_length(NvfsRead(0, 0, 512))}")
 // ```
-pub fn action_length(a: NvfsAction) -> Int []
-    todo("nvfs-core.nvfsop.action_length")
+pub @tier(app)
+fn action_length(a: NvfsAction) -> Int []
+    match a
+        NvfsRead(_, _, len)  => len
+        NvfsProg(_, _, data) => bytes.len(data)
+        NvfsErase(_)         => 0
+        NvfsSync             => 0
 
 // Whether an action respects the device's alignment and bounds.
 //
@@ -395,8 +534,26 @@ pub fn action_length(a: NvfsAction) -> Int []
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println("${nvfsop.action_is_valid(NvfsRead(0, 0, 512), g)}")
 // ```
-pub fn action_is_valid(a: NvfsAction, g: nvfsvol.NvfsGeometry) -> Bool []
-    todo("nvfs-core.nvfsop.action_is_valid")
+pub @tier(app)
+fn action_is_valid(a: NvfsAction, g: nvfsvol.NvfsGeometry) -> Bool []
+    // The action is the machine's own output, and this is where a
+    // machine that computed a block past the end of the device or an
+    // offset off a program page is caught.  The block is checked first:
+    // a read of block four billion is a read of nothing whatever its
+    // offset says.
+    match a
+        NvfsRead(block, off, len)  =>
+            block >= 0
+                and block < g.block_count
+                and nvfsgeo.access_is_valid(g.block_size, g.read_size, off, len)
+        NvfsProg(block, off, data) =>
+            block >= 0
+                and block < g.block_count
+                and nvfsgeo.access_is_valid(g.block_size, g.prog_size, off, bytes.len(data))
+        NvfsErase(block)           =>
+            block >= 0 and block < g.block_count
+        NvfsSync                   =>
+            true
 
 // The volume a machine is working on, or `None` before a mount.
 //
@@ -410,8 +567,9 @@ pub fn action_is_valid(a: NvfsAction, g: nvfsvol.NvfsGeometry) -> Bool []
 //         None    => println("not mounted")
 //         Some(_) => println("mounted")
 // ```
-pub fn volume(m: NvfsMachine) -> ?nvfsvol.NvfsVolume []
-    todo("nvfs-core.nvfsop.volume")
+pub @tier(app)
+fn volume(m: NvfsMachine) -> ?nvfsvol.NvfsVolume []
+    m.volume
 
 // A handle's current cursor.
 //
@@ -423,8 +581,9 @@ pub fn volume(m: NvfsMachine) -> ?nvfsvol.NvfsVolume []
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println("${nvfsop.handle_position(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine, 1)}")
 // ```
-pub fn handle_position(m: NvfsMachine, handle: Int) -> Int []
-    todo("nvfs-core.nvfsop.handle_position")
+pub @tier(app)
+fn handle_position(m: NvfsMachine, handle: Int) -> Int []
+    handle_position_of(m, handle)
 
 // Whether a handle is one this machine opened and has not closed.
 //
@@ -441,8 +600,11 @@ pub fn handle_position(m: NvfsMachine, handle: Int) -> Int []
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println("${nvfsop.handle_is_open(nvfsop.begin(g, nvfsvol.default_config(), NvfsMount).machine, 1)}")
 // ```
-pub fn handle_is_open(m: NvfsMachine, handle: Int) -> Bool []
-    todo("nvfs-core.nvfsop.handle_is_open")
+pub @tier(app)
+fn handle_is_open(m: NvfsMachine, handle: Int) -> Bool []
+    // Positions are never negative, so "no such handle" and "not open"
+    // are the same question asked twice.
+    handle_position_of(m, handle) >= 0
 
 // Whether an operation, run to completion, can change the device.
 //
@@ -456,8 +618,19 @@ pub fn handle_is_open(m: NvfsMachine, handle: Int) -> Bool []
 // fn main() [io]
 //     println("${nvfsop.op_is_mutating(NvfsReadDir("/"))}")
 // ```
-pub fn op_is_mutating(op: NvfsOp) -> Bool []
-    todo("nvfs-core.nvfsop.op_is_mutating")
+pub @tier(app)
+fn op_is_mutating(op: NvfsOp) -> Bool []
+    match op
+        NvfsFormat          => true
+        NvfsMkdir(_)        => true
+        NvfsRemove(_)       => true
+        NvfsRename(_, _)    => true
+        NvfsWrite(_, _)     => true
+        NvfsTruncate(_, _)  => true
+        // Only an open that may create one writes: an open of a file
+        // that is there reads the directory and takes a number.
+        NvfsOpen(_, create) => create
+        _                   => false
 
 // The path an operation names, and the empty string for one that names
 // none.
@@ -468,8 +641,16 @@ pub fn op_is_mutating(op: NvfsOp) -> Bool []
 // fn main() [io]
 //     println(nvfsop.op_path(NvfsReadDir("/logs")))
 // ```
-pub fn op_path(op: NvfsOp) -> Str []
-    todo("nvfs-core.nvfsop.op_path")
+pub @tier(app)
+fn op_path(op: NvfsOp) -> Str []
+    match op
+        NvfsStat(path)           => path
+        NvfsReadDir(path)        => path
+        NvfsMkdir(path)          => path
+        NvfsRemove(path)         => path
+        NvfsRename(from_path, _) => from_path
+        NvfsOpen(path, _)        => path
+        _                        => ""
 
 // An empty report, for a caller building one itself.
 //
@@ -480,8 +661,10 @@ pub fn op_path(op: NvfsOp) -> Str []
 // fn main() [io]
 //     println("${list.len(nvfsop.empty_report().problems)}")
 // ```
-pub fn empty_report() -> NvfsReport []
-    todo("nvfs-core.nvfsop.empty_report")
+pub @tier(app)
+fn empty_report() -> NvfsReport []
+    NvfsReport { blocks_used: 0, blocks_free: 0, files: 0, directories: 0,
+                 max_revision: 0, problems: [] }
 
 // Whether a report found nothing wrong.
 //
@@ -491,5 +674,1313 @@ pub fn empty_report() -> NvfsReport []
 // fn main() [io]
 //     println("${nvfsop.report_is_clean(nvfsop.empty_report())}")
 // ```
-pub fn report_is_clean(r: NvfsReport) -> Bool []
-    todo("nvfs-core.nvfsop.report_is_clean")
+pub @tier(app)
+fn report_is_clean(r: NvfsReport) -> Bool []
+    list.len(r.problems) == 0
+
+// ---------------------------------------------------------------------------
+// The phases, and the two functions that must agree about them.
+// ---------------------------------------------------------------------------
+//
+// THE PHASE NUMBER IS THE WHOLE OF A MACHINE'S POSITION.  `action_for`
+// reads it to say what the host must do next and `advance` moves it on
+// once the answer arrives, so those two are the only places a number is
+// understood and every number below appears in both:
+//
+//      0  a path walk reads the pair's first block
+//      1  ... its second, which is where the pair is arbitrated
+//      2  ... the winner, whose records are the fold
+//      3  a commit programs the staged record at the log's tail
+//      4  ... and syncs, which is what makes the commit durable
+//      5  a compaction reads the active block for its records
+//      6  ... erases the sibling it is moving into
+//      7  ... programs the compacted records
+//      8  ... programs the seal, which is the last thing written
+//      9  a mount reads the second block of the root pair
+//     10  a chain read reads one more block
+//     11  a check reads one more block of the device
+//     20  a format erases the sibling, then (21) the block it writes,
+//         (22) programs the superblock's record, (23) its seal, (24) syncs
+//    100  finished
+//    101  failed
+//
+// A phase at or above 100 is terminal: `action_for` answers None,
+// `pending` answers None, and a machine that is resumed anyway is a
+// driver bug and answers `NvfsCorrupt`.
+
+// The phase a finished machine is in.
+@tier(app)
+fn phase_done() -> Int []
+    100
+
+// The phase a failed machine is in.
+@tier(app)
+fn phase_failed() -> Int []
+    101
+
+// Whether a machine has stopped for good.
+@tier(app)
+fn is_terminal(m: NvfsMachine) -> Bool []
+    m.phase >= phase_done()
+
+// A whole block, which is the span every read asks for.
+//
+// The whole block and not the record area: a scan needs the records AND
+// the erased tail to decide where an append may start, and the four
+// callbacks littlefs publishes are block-shaped.
+@tier(app)
+fn read_span(m: NvfsMachine) -> Int []
+    m.geometry.block_size
+
+// Where a block's records start: past the revision word's own program
+// page.
+@tier(app)
+fn records_start(m: NvfsMachine) -> Int []
+    nvfsgeo.meta_offset(m.geometry.prog_size)
+
+// A newly begun machine.
+@tier(app)
+fn fresh(g: nvfsvol.NvfsGeometry, c: nvfsvol.NvfsConfig, op: NvfsOp, cursor: Int) -> NvfsMachine []
+    NvfsMachine { geometry: g, config: c, op: op, phase: 0,
+                  pair: nvfsmeta.pair(nvfsgeo.root_pair_first(),
+                                      nvfsgeo.root_pair_second()),
+                  cursor: cursor, walk_block: 0, walk_index: 0, walk_target: 0,
+                  actions_taken: 0, volume: None, first_scan: None,
+                  pending: bytes.zeros(0), staged: bytes.zeros(0),
+                  handles: [], paths: [], next_handle: 1, attempts: 0,
+                  read_to: 0, problems: [], directories: 0 }
+
+// A machine that has finished, with its answer.
+@tier(app)
+fn finished(var m: NvfsMachine, r: NvfsResult) -> NvfsProgress []
+    m.phase = phase_done()
+    NvfsProgress { machine: m, step: NvfsDone(r) }
+
+// A machine that has failed, with its reason.
+@tier(app)
+fn broken(var m: NvfsMachine, e: nvfsgeo.NvfsError) -> NvfsProgress []
+    m.phase = phase_failed()
+    NvfsProgress { machine: m, step: NvfsFailed(e) }
+
+// A machine that stopped to have one more action performed.
+@tier(app)
+fn needing(m: NvfsMachine, a: NvfsAction) -> NvfsProgress []
+    NvfsProgress { machine: m, step: NvfsNeed(a) }
+
+// Enter a phase and ask for the action it wants.
+//
+// The one place a phase is set from outside the advance functions, so
+// that "the machine is in phase N" and "the machine wants what phase N
+// wants" cannot come apart.
+@tier(app)
+fn enter(var m: NvfsMachine, phase: Int) -> NvfsProgress []
+    m.phase = phase
+    m.attempts = 0
+    match action_for(var m, m.staged)
+        // cov: skip — a phase only `enter` sets, and every caller passes a phase its own operation's map lists; a terminal machine never reaches a map at all.
+        None    => broken(var m, NvfsCorrupt)
+        Some(a) => needing(m, a)
+
+// The action a machine is waiting on.
+//
+// Private because it is half of the machine's position: `pending` is its
+// only exported reader and the advance functions are the other half, so
+// a second exported spelling of "what does this phase want" would be a
+// second place for the two to disagree.
+//
+// The staged image is a parameter rather than a field read so that the
+// one caller inside this module may pass the buffer itself while
+// `pending`, which holds the machine by value, passes a copy.
+@tier(app)
+fn action_for(var m: NvfsMachine, staged: Bytes) -> ?NvfsAction []
+    if is_terminal(m)
+        // A finished machine wants nothing, which is what makes
+        // `pending` answer None with no second field saying so.
+        None
+    else
+        match m.op
+            NvfsFormat => format_action(m, staged)
+            NvfsMount  => mount_action(m)
+            NvfsCheck  => check_action(m)
+            _          => walk_action(m, staged)
+
+// What a format's phases want.
+//
+// The sibling is erased first, then the block the records go in: a cut
+// between the two leaves block 0 exactly as it was and block 1 erased,
+// which is a device whose pair has no sealed block at all — the
+// `NvfsNoFilesystem` case, and never a half-written volume.
+@tier(app)
+fn format_action(m: NvfsMachine, staged: Bytes) -> ?NvfsAction []
+    match m.phase
+        20 => Some(NvfsErase(nvfsgeo.root_pair_second()))
+        21 => Some(NvfsErase(nvfsgeo.root_pair_first()))
+        22 => Some(NvfsProg(nvfsgeo.root_pair_first(), records_start(m), staged))
+        23 =>
+            Some(NvfsProg(nvfsgeo.root_pair_first(), nvfswear.seal_offset(),
+                          nvfsmeta.seal_image(1, m.geometry.prog_size)))
+        24 => Some(NvfsSync)
+        _  =>
+            // cov: skip — a format is only ever one of the values listed above.
+            None
+
+// What a mount's phases want.
+//
+// Both blocks of the root pair are read and then the winner is read
+// again: the machine holds one scanned block at a time, so the records
+// that carry the superblock are only in hand during the third read.
+@tier(app)
+fn mount_action(m: NvfsMachine) -> ?NvfsAction []
+    match m.phase
+        0 => Some(NvfsRead(nvfsgeo.root_pair_first(), 0, read_span(m)))
+        9 => Some(NvfsRead(nvfsgeo.root_pair_second(), 0, read_span(m)))
+        2 => Some(NvfsRead(m.pair.first, 0, read_span(m)))
+        _ =>
+            // cov: skip — a mount's phases are 0, 9 and 2, all three listed above.
+            None
+
+// What a check's phases want.
+@tier(app)
+fn check_action(m: NvfsMachine) -> ?NvfsAction []
+    if m.phase == 11
+        Some(NvfsRead(m.cursor, 0, read_span(m)))
+    else
+        // cov: skip — a check's only phase is 11, and every other value is terminal, which action_for answers None for first.
+        None
+
+// What a path operation's phases want, and a chain read's one phase
+// wants.
+@tier(app)
+fn walk_action(m: NvfsMachine, staged: Bytes) -> ?NvfsAction []
+    match m.phase
+        0  => Some(NvfsRead(m.pair.first, 0, read_span(m)))
+        1  => Some(NvfsRead(m.pair.second, 0, read_span(m)))
+        2  => Some(NvfsRead(m.pair.first, 0, read_span(m)))
+        3  => Some(NvfsProg(m.walk_block, m.walk_target, staged))
+        4  => Some(NvfsSync)
+        5  => Some(NvfsRead(m.pair.first, 0, read_span(m)))
+        6  => Some(NvfsErase(m.pair.second))
+        7  => Some(NvfsProg(m.pair.second, records_start(m), staged))
+        8  =>
+            Some(NvfsProg(m.pair.second, nvfswear.seal_offset(),
+                          nvfsmeta.seal_image(m.cursor, m.geometry.prog_size)))
+        10 => Some(NvfsRead(m.walk_block, 0, read_span(m)))
+        _  =>
+            // cov: skip — a walk's phases are 0-8 and 10, all of them listed above.
+            None
+
+// Whether an action is answered with an acknowledgement.
+//
+// A read is answered with bytes; a program, an erase and a sync are
+// answered by whether they worked.  `NvfsSync` is why this is not
+// `action_is_write`: a sync changes nothing and still needs an answer.
+@tier(app)
+fn action_is_ack(a: NvfsAction) -> Bool []
+    match a
+        NvfsRead(_, _, _) => false
+        _                 => true
+
+// Whether an action erases a block.
+@tier(app)
+fn action_is_erase(a: NvfsAction) -> Bool []
+    match a
+        NvfsErase(_) => true
+        _            => false
+
+// Move a machine on, given an answer.
+//
+// `data` is the bytes a read answered, or empty for the three
+// acknowledgements; the phase says which kind arrived, so there is no
+// second entry point per answer kind.
+@tier(app)
+fn advance(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    m.actions_taken = m.actions_taken + 1
+    match m.op
+        NvfsFormat => advance_format(var m, data)
+        NvfsMount  => advance_mount(var m, data)
+        NvfsCheck  => advance_check(var m, data)
+        _          =>
+            if m.phase == 10
+                advance_chain(var m, data)
+            elif m.phase >= 3 and m.phase <= 8
+                advance_commit(var m, data)
+            else
+                advance_walk(var m, data)
+
+// One block of the device, scanned with the machine's own geometry.
+@tier(app)
+fn scan_of(m: NvfsMachine, data: Bytes) -> nvfsmeta.NvfsScan []
+    nvfsmeta.scan_block(m.geometry.prog_size, m.geometry.block_size, data)
+
+// ---------------------------------------------------------------------------
+// Format and mount.
+// ---------------------------------------------------------------------------
+
+// The two operations a device that was never mounted can run.
+@tier(app)
+fn begin_fresh(var m: NvfsMachine, op: NvfsOp) -> NvfsProgress []
+    match op
+        NvfsFormat => enter(var m, 20)
+        NvfsMount  => enter(var m, 0)
+        _          => broken(var m, NvfsNotSupported)
+
+// The operations a mounted volume can run.
+//
+// A format and a mount begin on a DEVICE, so running either over a
+// volume is a driver decision this call does not make.  A close is here
+// and writes nothing, because every write is committed when it is made
+// and all a close does is forget the number.
+@tier(app)
+fn begin_mounted(var m: NvfsMachine, op: NvfsOp) -> NvfsProgress []
+    match op
+        NvfsFormat         => broken(var m, NvfsNotSupported)
+        NvfsMount          => broken(var m, NvfsNotSupported)
+        NvfsClose(h)       =>
+            if handle_close(var m, h)
+                finished(var m, NvfsCompleted)
+            else
+                broken(var m, NvfsNotFound)
+        NvfsCheck          =>
+            // A check starts at block zero and reads its way up.
+            m.cursor = 0
+            enter(var m, 11)
+        NvfsReadFile(h, _) => handle_start(var m, h)
+        NvfsWrite(h, _)    => handle_start(var m, h)
+        NvfsSeek(h, _, _)  => handle_start(var m, h)
+        NvfsTruncate(h, _) => handle_start(var m, h)
+        _                  =>
+            m.walk_index = 0
+            enter(var m, 0)
+
+// Start a handle-based operation, or refuse it before the walk.
+//
+// A handle is a number THE MACHINE issued, so a number it never issued
+// is knowable without reading anything: refused here rather than after a
+// walk that would read the directory to find a path the table does not
+// hold.  The walk that follows resolves the path the handle was opened
+// at, which is what keeps a handle meaningful across a rename-free
+// volume: the entry is found by name, not by a directory slot nothing
+// else in this format numbers.
+@tier(app)
+fn handle_start(var m: NvfsMachine, h: Int) -> NvfsProgress []
+    if not handle_is_open(m, h)
+        broken(var m, NvfsNotFound)
+    else
+        m.walk_index = 0
+        enter(var m, 0)
+
+// A format's phases.
+@tier(app)
+fn advance_format(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    match m.phase
+        20 => enter(var m, 21)
+        21 =>
+            // The superblock's own record, built here rather than by an
+            // operation's commit: it is the one record a volume has before it
+            // has anything else, and it is written from the geometry and
+            // configuration the machine was born with.
+            m.staged = nvfsmeta.append_image(
+                nvfsmeta.record(nvfsvol.record_type_superblock(),
+                                nvfsvol.encode_superblock(m.geometry, m.config)),
+                m.geometry.prog_size)
+            enter(var m, 22)
+        22 => enter(var m, 23)
+        23 => enter(var m, 24)
+        _  =>
+            // The sync landed, so the seal is on the part and the volume
+            // exists.  The revision is one, which is what makes a
+            // freshly-formatted device mount from block 0.
+            mount_result(var m, nvfsvol.superblock(nvfsgeo.format_version(),
+                                               m.geometry.block_size,
+                                               m.geometry.block_count,
+                                               m.config.name_max,
+                                               m.config.inline_max,
+                                               m.config.file_max,
+                                               m.config.block_cycles),
+                                               1)
+
+// Put a finished machine back at the start of another operation,
+// keeping what belongs to the machine rather than to one operation: its
+// volume, its handle table, and its action count.
+//
+// A machine that never mounted can run the two device operations, exactly
+// as `begin` can; one that mounted runs the rest, exactly as `begin_on`
+// can.
+@tier(app)
+fn reset_op(var m: NvfsMachine, op: NvfsOp) -> NvfsProgress []
+    m.op = op
+    m.phase = 0
+    m.attempts = 0
+    m.first_scan = None
+    m.pending = bytes.zeros(0)
+    m.staged = bytes.zeros(0)
+    m.problems = []
+    m.directories = 0
+    m.walk_index = 0
+    m.walk_block = 0
+    m.walk_target = 0
+    m.read_to = 0
+    // Back to the root, which is where every operation begins.  The pair
+    // is the WALK's position and a finished operation left it wherever
+    // the walk arrived — inside a subdirectory, most often — so an
+    // operation that did not re-seed it would run in the directory the
+    // last one read.  The constant root pair is the right seed even
+    // after a compaction has flipped the two blocks' physical order:
+    // the walk reads both and `arbitrate` re-derives the active one from
+    // the sealed revision, never from the order they were named in.
+    m.pair = nvfsmeta.pair(nvfsgeo.root_pair_first(), nvfsgeo.root_pair_second())
+    match m.volume
+        None    =>
+            m.cursor = nvfswear.cursor_seed(0, m.geometry.block_count)
+            begin_fresh(var m, op)
+        Some(v) =>
+            m.cursor = nvfswear.cursor_seed(v.revision, m.geometry.block_count)
+            begin_mounted(var m, op)
+
+// A mount's phases.
+//
+// Both the division of labour and the failure modes are littlefs's: an
+// erased device is `NvfsNoFilesystem`, which is what a boot sequence
+// turns on to decide to format, and a device with structure that cannot
+// be read is `NvfsCorrupt`, which is what it turns on to stop.
+@tier(app)
+fn advance_mount(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    if m.phase == 0
+        m.first_scan = Some(scan_of(m, data))
+        enter(var m, 9)
+    elif m.phase == 9
+        mount_arbitrate(var m, scan_of(m, data))
+    else
+        // The winner's records.  The superblock is checked against the
+        // device it was read from rather than trusted: an image built for
+        // 4 KiB blocks read as 64 KiB ones would find records at
+        // plausible offsets and answer nonsense.
+        let scan = scan_of(m, data)
+        match nvfsvol.find_superblock(nvfsmeta.scan_records(scan))
+            None          =>
+                // A sealed root pair with no superblock record in it is
+                // not a volume: the record is what a volume IS.
+                broken(var m, NvfsCorrupt)
+            Some(payload) => read_superblock(var m, payload, nvfsmeta.scan_revision(scan))
+
+// Arbitrate the root pair, with the first block's scan in hand.
+@tier(app)
+fn mount_arbitrate(var m: NvfsMachine, second: nvfsmeta.NvfsScan) -> NvfsProgress []
+    match m.first_scan
+        // cov: skip — first_scan is set by the pair's first read, and this point is reached only from the second.
+        None        => broken(var m, NvfsCorrupt)
+        Some(first) => mount_pair(var m, first, second)
+
+// Which block of the root pair a mount continues from.
+@tier(app)
+fn mount_pair(var m: NvfsMachine, first: nvfsmeta.NvfsScan,
+              second: nvfsmeta.NvfsScan) -> NvfsProgress []
+    let state = nvfsmeta.arbitrate(m.pair, first, second)
+    if state.ok
+        m.pair = nvfsmeta.pair(state.active, state.sibling)
+        enter(var m, 2)
+    elif nvfsmeta.pair_is_blank(first, second)
+        // Nothing was ever written here, and that is what a boot
+        // sequence formats over.
+        broken(var m, NvfsNoFilesystem)
+    else
+        // Structure that cannot be read: something ate the filesystem.
+        broken(var m, NvfsCorrupt)
+
+// Decode a superblock payload, hold it to the device it came from, and
+// answer the volume.
+@tier(app)
+fn read_superblock(var m: NvfsMachine, payload: Bytes, revision: Int) -> NvfsProgress []
+    match nvfsvol.decode_superblock(payload)
+        Err(e) => broken(var m, e)
+        Ok(sb) =>
+            if not nvfsvol.geometry_matches(sb, m.geometry)
+                // An image built for another part, and the check a
+                // truncated device fails: the superblock's counts are
+                // what the volume was built for and this device is not
+                // it.
+                broken(var m, NvfsGeometryMismatch)
+            else
+                mount_result(var m, sb, revision)
+
+// The answer a mount or a format reports.
+@tier(app)
+fn mount_result(var m: NvfsMachine, sb: nvfsvol.NvfsSuperblock, revision: Int) -> NvfsProgress []
+    let v = nvfsvol.volume(m.geometry, sb, revision, m.pair.first)
+    m.volume = Some(nvfsvol.volume(v.geometry, v.superblock, v.revision, v.active))
+    finished(var m, NvfsMounted(v))
+
+// ---------------------------------------------------------------------------
+// The path walk, and the operations that happen where it arrives.
+// ---------------------------------------------------------------------------
+
+// A path operation's phases: down the tree, then the operation itself.
+@tier(app)
+fn advance_walk(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    if m.phase == 0
+        m.first_scan = Some(scan_of(m, data))
+        enter(var m, 1)
+    elif m.phase == 1
+        walk_arbitrate(var m, scan_of(m, data))
+    else
+        // The active block's records, folded.  The fold is the
+        // directory: a name written twice is the later record, a
+        // tombstone removes one, and a rename moves one.
+        let scan = scan_of(m, data)
+        let entries = nvfsvol.fold(nvfsmeta.scan_records(scan))
+        // Where an append would go.  The scanner answers the block's size
+        // for a torn log, so a torn block refuses an append through the
+        // same arithmetic that grants one.
+        m.walk_block = m.pair.first
+        m.walk_target = nvfsmeta.scan_end(scan)
+        let components = walk_components(m)
+        let count = list.len(components)
+        let depth = walk_depth(m.op, count)
+        if m.walk_index < depth
+            descend(var m, entries, components)
+        else
+            act(var m, entries, leaf_name(components, count), count)
+
+// Arbitrate a pair the walk is descending into.
+@tier(app)
+fn walk_arbitrate(var m: NvfsMachine, second: nvfsmeta.NvfsScan) -> NvfsProgress []
+    match m.first_scan
+        // cov: skip — first_scan is set by the pair's first read, and this point is reached only from the second.
+        None        => broken(var m, NvfsCorrupt)
+        Some(first) => walk_pair(var m, first, second)
+
+// Which block of a walked-into pair the walk continues from.
+@tier(app)
+fn walk_pair(var m: NvfsMachine, first: nvfsmeta.NvfsScan,
+             second: nvfsmeta.NvfsScan) -> NvfsProgress []
+    let state = nvfsmeta.arbitrate(m.pair, first, second)
+    if state.ok
+        m.pair = nvfsmeta.pair(state.active, state.sibling)
+        enter(var m, 2)
+    else
+        // A pair with neither block sealed is not a directory, whatever
+        // named it.  This is the damaged-image case the format refuses to
+        // read through: a dirent whose pair has been erased, or a root
+        // pair that was never written.
+        broken(var m, NvfsCorrupt)
+
+// The components an operation has to walk.
+//
+// A handle-based operation names a handle, and the path that handle named
+// is in the table: this is what "every operation walks from the root"
+// means for a handle.  A handle the machine does not hold answers no
+// components, which lands the walk on the root and fails there with
+// `NvfsNotFound` rather than reading a name nobody asked for.
+@tier(app)
+fn walk_components(m: NvfsMachine) -> [Str] []
+    match m.op
+        NvfsReadFile(handle, _) => nvfsvol.path_components(handle_path_of(m, handle))
+        NvfsWrite(handle, _)    => nvfsvol.path_components(handle_path_of(m, handle))
+        NvfsSeek(handle, _, _)  => nvfsvol.path_components(handle_path_of(m, handle))
+        NvfsTruncate(handle, _) => nvfsvol.path_components(handle_path_of(m, handle))
+        _                       => nvfsvol.path_components(op_path(m.op))
+
+// How many components deep an operation acts.
+//
+// `NvfsReadDir` acts IN the directory it names, which is all of them;
+// every other operation acts in the leaf's PARENT, which is one fewer,
+// because the record it writes belongs to the parent's log.  A path of
+// "/" is zero components and the root is where both land.
+@tier(app)
+fn walk_depth(op: NvfsOp, count: Int) -> Int []
+    match op
+        NvfsReadDir(_) => count
+        _              =>
+            var depth = count - 1
+            if depth < 0
+                depth = 0
+            depth
+
+// A path's last component, and the empty string for the root.
+//
+// The element is bound before the branch that chooses between it and
+// nothing, rather than the `list.get` standing as the branch's value:
+// on the LLVM backend a `list.get` in that slot answers `""` — neither
+// the element nor its own default — when the list came from a call.
+// The binding is the workaround.
+@tier(app)
+fn leaf_name(components: [Str], count: Int) -> Str []
+    let last = list.get(components, count - 1, "")
+    if count == 0
+        ""
+    else
+        last
+
+// The longest name this volume accepts.
+//
+// The superblock's bound rather than the running configuration's: the
+// bound is an ON-DISK contract, and a reader with a larger setting must
+// not write a name an older reader cannot hold.
+@tier(app)
+fn name_bound(m: NvfsMachine) -> Int []
+    match m.volume
+        // cov: skip — only a mounted machine runs a path operation (`begin_fresh` refuses the rest), so the volume is in hand wherever the bound is asked for.
+        None    => m.config.name_max
+        Some(v) => v.superblock.name_max
+
+// One level down: the component must be a directory, and its pair's
+// blocks must be inside the device.
+//
+// Both checks happen BEFORE the pair is read, which is the point: a
+// dirent is attacker-controlled input, and a pair outside the device is
+// refused rather than read.
+@tier(app)
+fn descend(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], components: [Str]) -> NvfsProgress []
+    let name = list.get(components, m.walk_index, "")
+    match nvfsvol.find(entries, name)
+        None    => broken(var m, NvfsNotFound)
+        Some(e) =>
+            if not nvfsvol.entry_is_directory(e)
+                broken(var m, NvfsNotDirectory)
+            elif not nvfsvol.entry_pair_is_plausible(e, m.geometry.block_count)
+                broken(var m, NvfsCorrupt)
+            else
+                m.pair = nvfsmeta.pair(e.word_first, e.word_second)
+                m.walk_index = m.walk_index + 1
+                enter(var m, 0)
+
+// The step an operation takes once its walk has arrived.
+//
+// One function rather than one per operation, because every operation
+// arrives at the same place: the entries of the directory its record
+// belongs to, the leaf's name, and how deep the path was.
+@tier(app)
+fn act(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, count: Int) -> NvfsProgress []
+    match m.op
+        NvfsStat(_)                    => act_stat(var m, entries, leaf, count)
+        NvfsReadDir(_)                 => finished(var m, NvfsEntries(entries[:]))
+        NvfsMkdir(_)                   => act_mkdir(var m, entries, leaf, count)
+        NvfsRemove(_)                  => act_remove(var m, entries, leaf, count)
+        NvfsRename(from_path, to_path) => act_rename(var m, entries, leaf, count, from_path, to_path)
+        NvfsOpen(_, create)            => act_open(var m, entries, leaf, create)
+        NvfsReadFile(handle, len)      => read_file(var m, entries, leaf, handle, len)
+        NvfsWrite(handle, data)        => write_file(var m, entries, leaf, handle, data)
+        NvfsSeek(handle, off, whence)  => seek_file(var m, entries, leaf, handle, off, whence)
+        NvfsTruncate(handle, size)     => truncate_file(var m, entries, leaf, handle, size)
+        // cov: skip — a close is answered by `begin_mounted` and never walks, so `act` cannot see one.
+        NvfsClose(_)                   => finished(var m, NvfsCompleted)
+        // cov: skip — every operation that walks is listed above; a format, a mount and a check never reach `act`.
+        _                              => broken(var m, NvfsNotSupported)
+
+// A stat: the entry, or the root's own synthetic one.
+@tier(app)
+fn act_stat(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str,
+            count: Int) -> NvfsProgress []
+    if count == 0
+        // The root is a directory entry too, and a stat of "/" is a stat
+        // of it rather than a NotFound: a caller walking a tree asks
+        // what each thing is, starting there.
+        finished(var m, NvfsStatted(nvfsvol.directory_entry(
+            "", nvfsgeo.root_pair_first(), nvfsgeo.root_pair_second())))
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) => finished(var m, NvfsStatted(e))
+
+// A new directory, which this format can name and cannot yet place.
+@tier(app)
+fn act_mkdir(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str,
+             count: Int) -> NvfsProgress []
+    if count == 0
+        broken(var m, NvfsExists)
+    elif not nvfsvol.name_is_valid(leaf, name_bound(m))
+        broken(var m, NvfsNameTooLong)
+    else
+        match nvfsvol.find(entries, leaf)
+            Some(_) => broken(var m, NvfsExists)
+            None    =>
+                // A new directory needs a PAIR of its own, and "free"
+                // means "not reachable from the root" rather than
+                // "erased": deciding it means walking the whole tree, and
+                // the two commits that would follow — the new pair's,
+                // then the parent's dirent — are two pair slots this
+                // machine has one of.  Refused, and named, rather than a
+                // dirent that could name an erased pair.
+                broken(var m, NvfsNotSupported)
+
+// A remove, which is one tombstone for a file and impossible for a
+// directory.
+@tier(app)
+fn act_remove(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str,
+              count: Int) -> NvfsProgress []
+    if count == 0
+        // There is no parent log to write the root's tombstone in.
+        broken(var m, NvfsNotSupported)
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) =>
+                if nvfsvol.entry_is_directory(e)
+                    // A directory's tombstone would orphan whatever its
+                    // pair holds: knowing it is empty means walking it,
+                    // and a recursive remove is not one atomic commit
+                    // (the op's own doc says so).
+                    broken(var m, NvfsNotSupported)
+                else
+                    m.pending = nvfsvol.encode_tombstone(leaf)
+                    begin_commit(var m)
+
+// A rename inside one directory, which is one record.
+@tier(app)
+fn act_rename(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, count: Int,
+              from_path: Str, to_path: Str) -> NvfsProgress []
+    if from_path == to_path
+        // A rename to the name it already has is done, and answering
+        // `NvfsExists` would read as a failure.
+        finished(var m, NvfsCompleted)
+    elif count == 0
+        broken(var m, NvfsNotSupported)
+    elif not nvfsvol.same_parent(from_path, to_path)
+        // Two pairs committed together, which this format cannot express
+        // (the op's own doc says so).
+        broken(var m, NvfsNotSupported)
+    else
+        rename_within(var m, entries, leaf, to_path)
+
+// The rename, once the walk has arrived and the parents agree.
+@tier(app)
+fn rename_within(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str,
+                 to_path: Str) -> NvfsProgress []
+    let to_leaf = nvfsvol.basename(to_path)
+    if not nvfsvol.name_is_valid(to_leaf, name_bound(m))
+        broken(var m, NvfsNameTooLong)
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(_) =>
+                match nvfsvol.find(entries, to_leaf)
+                    Some(_) => broken(var m, NvfsExists)
+                    None    =>
+                        // One record, one commit: a reader sees the old
+                        // name or the new one and never both.
+                        m.pending = nvfsvol.encode_rename(leaf, to_leaf)
+                        begin_commit(var m)
+
+// An open: an entry that is there takes a handle, and a missing one is
+// created inline and empty.
+@tier(app)
+fn act_open(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str,
+            create: Bool) -> NvfsProgress []
+    match nvfsvol.find(entries, leaf)
+        Some(e) =>
+            if nvfsvol.entry_is_directory(e)
+                broken(var m, NvfsIsDirectory)
+            else
+                finished(var m, NvfsHandle(handle_open(var m, op_path(m.op))))
+        None    =>
+            if not create
+                broken(var m, NvfsNotFound)
+            elif not nvfsvol.name_is_valid(leaf, name_bound(m))
+                broken(var m, NvfsNameTooLong)
+            else
+                // A file is created inline and empty, so the record that
+                // names it is the whole of the creation and costs no
+                // data block at all.
+                m.pending = nvfsvol.encode_entry(nvfsvol.inline_entry(leaf, bytes.zeros(0)))
+                begin_commit(var m)
+
+// ---------------------------------------------------------------------------
+// Handles: the table, and the operations that read through it.
+// ---------------------------------------------------------------------------
+
+// The position a handle is at, or -1 when this machine does not hold it.
+//
+// `handles` is flat id/position pairs, so a hit is found by stepping two
+// at a time.
+@tier(app)
+fn handle_position_of(m: NvfsMachine, handle: Int) -> Int []
+    var found = 0 - 1
+    var i = 0
+    while found < 0 and i * 2 + 1 < list.len(m.handles)
+        let id = list.get(m.handles, i * 2, 0 - 1)
+        if id == handle
+            found = list.get(m.handles, i * 2 + 1, 0 - 1)
+        i = i + 1
+    found
+
+// The path a handle names, and the empty string for one this machine
+// does not hold.
+@tier(app)
+fn handle_path_of(m: NvfsMachine, handle: Int) -> Str []
+    var out = ""
+    var i = 0
+    while i * 2 + 1 < list.len(m.handles)
+        let id = list.get(m.handles, i * 2, 0 - 1)
+        if id == handle
+            out = list.get(m.paths, i, "")
+        i = i + 1
+    out
+
+// Take a handle, remembering the path it names.
+//
+// The id is one more than the last, so a number handed out is never
+// handed out again in one machine's life, and a host that kept a stale
+// one is told "no such handle" rather than given another file.
+@tier(app)
+fn handle_open(var m: NvfsMachine, path: Str) -> Int []
+    let id = m.next_handle
+    m.handles = list.push(m.handles, id)
+    m.handles = list.push(m.handles, 0)
+    m.paths = list.push(m.paths, path)
+    m.next_handle = id + 1
+    id
+
+// Forget a handle, answering whether it was there to forget.
+@tier(app)
+fn handle_close(var m: NvfsMachine, handle: Int) -> Bool []
+    var kept: [Int] = []
+    var kept_paths: [Str] = []
+    var found = false
+    var i = 0
+    while i * 2 + 1 < list.len(m.handles)
+        let id = list.get(m.handles, i * 2, 0 - 1)
+        let at = list.get(m.handles, i * 2 + 1, 0 - 1)
+        if id == handle
+            found = true
+        else
+            kept = list.push(kept, id)
+            kept = list.push(kept, at)
+            kept_paths = list.push(kept_paths, list.get(m.paths, i, ""))
+        i = i + 1
+    m.handles = kept
+    m.paths = kept_paths
+    found
+
+// Move a handle's cursor, which is a write to the table and nothing to
+// the device.
+@tier(app)
+fn handle_move_to(var m: NvfsMachine, handle: Int, pos: Int) []
+    var out: [Int] = []
+    var i = 0
+    while i * 2 + 1 < list.len(m.handles)
+        let id = list.get(m.handles, i * 2, 0 - 1)
+        let at = list.get(m.handles, i * 2 + 1, 0 - 1)
+        out = list.push(out, id)
+        if id == handle
+            out = list.push(out, pos)
+        else
+            out = list.push(out, at)
+        i = i + 1
+    m.handles = out
+
+// The handle a chain read belongs to, so its cursor can be found again
+// after the walk has moved the machine's three walk numbers on.
+@tier(app)
+fn read_handle(op: NvfsOp) -> Int []
+    match op
+        NvfsReadFile(handle, _) => handle
+        // cov: skip — read_handle is called only from a chain read's arrival, whose operation is a read by construction.
+        _                       => 0 - 1
+
+// Reading through a handle: an inline file is a slice, a chain is a
+// walk.
+@tier(app)
+fn read_file(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, handle: Int,
+             len: Int) -> NvfsProgress []
+    let pos = handle_position_of(m, handle)
+    if pos < 0
+        // cov: skip — `handle_start` refuses a handle the machine does not hold before the walk begins, so the walk arrives with a live cursor.
+        broken(var m, NvfsNotFound)
+    elif len <= 0
+        finished(var m, NvfsData(bytes.zeros(0)))
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) =>
+                if nvfsvol.entry_is_directory(e)
+                    broken(var m, NvfsIsDirectory)
+                elif nvfsctz.is_inline(nvfsvol.entry_size(e), name_bound(m))
+                    inline_read(var m, handle, e, pos, len)
+                else
+                    chain_read(var m, handle, e, pos, len)
+
+// The inline case: the contents are in the entry, so a read is a slice
+// and the cursor moves by what it got.
+@tier(app)
+fn inline_read(var m: NvfsMachine, handle: Int, e: nvfsvol.NvfsEntry, pos: Int,
+               len: Int) -> NvfsProgress []
+    let size = bytes.len(e.inline_data)
+    let from = clamp(pos, size)
+    let to = clamp(pos + len, size)
+    if to <= from
+        finished(var m, NvfsData(bytes.zeros(0)))
+    else
+        handle_move_to(var m, handle, to)
+        finished(var m, NvfsData(bytes.slice(e.inline_data, from, to)))
+
+// The chain case: a seek to the target index, then a read of one block
+// per jump.
+//
+// Four checks before a single block is read, because the entry is
+// attacker-controlled input: the device must be able to hold a payload at
+// all, the entry's declared size must be one this volume could hold, the
+// read must start before the file's end, and the head must be a block of
+// this device.  A head of four billion is refused here rather than read.
+@tier(app)
+fn chain_read(var m: NvfsMachine, handle: Int, e: nvfsvol.NvfsEntry, pos: Int,
+              len: Int) -> NvfsProgress []
+    let capacity = nvfsctz.capacity(m.geometry.block_size, m.geometry.block_count)
+    let size = e.word_second
+    if capacity <= 0
+        broken(var m, NvfsCorrupt)
+    elif size > m.config.file_max
+        broken(var m, NvfsCorrupt)
+    elif pos >= size
+        finished(var m, NvfsData(bytes.zeros(0)))
+    elif not nvfsctz.pointer_is_plausible(e.word_first, m.geometry.block_count)
+        broken(var m, NvfsCorrupt)
+    else
+        m.read_to = clamp(pos + len, size)
+        m.walk_block = e.word_first
+        m.walk_index = nvfsctz.last_index(size, capacity)
+        m.walk_target = nvfsctz.index_of_offset(pos, capacity)
+        enter(var m, 10)
+
+// One block of a chain read: the target block, which is where the read
+// happens, or a jump towards it.
+//
+// The jump is the CTZ seek — the longest pointer that does not overshoot
+// — and the block it names is bounds-checked before the next read is
+// asked for, so a chain that points into the superblock, past the end of
+// the part, or at a slot that was never written is refused rather than
+// followed.
+@tier(app)
+fn advance_chain(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    let pointers = nvfsctz.pointer_count(m.geometry.block_count)
+    let payload_start = nvfsctz.data_offset(m.geometry.block_count)
+    let capacity = nvfsctz.capacity(m.geometry.block_size, m.geometry.block_count)
+    if bytes.len(data) < payload_start + capacity
+        // The host answered a short block, or the geometry and the device
+        // disagree about how big a block is: either way the bytes this
+        // step would read are not in hand.
+        broken(var m, NvfsCorrupt)
+    else
+        let w = nvfsctz.walk(m.walk_block, m.walk_index, m.walk_target)
+        if m.walk_index == m.walk_target
+            chain_arrive(var m, data, payload_start, capacity)
+        elif nvfsctz.walk_done(w)
+            // The walk stopped short of the index the read wants: the
+            // chain is shorter than the entry's size claims.
+            // cov: skip — the walk's index starts at the file's last index and every jump lands on or above the target, so `walk_done` here would mean equality, which the arm above catches.
+            broken(var m, NvfsCorrupt)
+        else
+            chain_jump(var m, data, w, pointers)
+
+// One jump of a chain walk.
+@tier(app)
+fn chain_jump(var m: NvfsMachine, data: Bytes, w: nvfsctz.NvfsCtzWalk,
+              pointers: Int) -> NvfsProgress []
+    let j = nvfsctz.walk_jump(w, pointers)
+    if j < 0
+        // Not arrived, yet no jump lands on the target: the chain does
+        // not reach the byte the entry says it holds.
+        // cov: skip — a walk above its target always has a jump of 0 that lands on or above it, so `walk_jump` cannot answer -1 in this branch.
+        broken(var m, NvfsCorrupt)
+    else
+        let raw = bytes.u32_le_at(data, nvfsctz.pointer_offset(j)) ?? nvfsctz.absent_pointer()
+        if not nvfsctz.pointer_is_plausible(raw, m.geometry.block_count)
+            // An absent slot, or a slot pointing before the device or
+            // past it.  Refused before the read it would ask for.
+            broken(var m, NvfsCorrupt)
+        else
+            let stepped = nvfsctz.walk_step(w, j, raw)
+            m.walk_block = nvfsctz.walk_block(stepped)
+            m.walk_index = nvfsctz.walk_index(stepped)
+            enter(var m, 10)
+
+// A chain read's target block: the payload slice the caller asked for,
+// and the cursor moved by what it got.
+//
+// The slice is bounded by the block's own capacity, so a read that asks
+// for more than the block holds answers what the block holds and the
+// caller asks again — which is the same short read a file's end gives.
+@tier(app)
+fn chain_arrive(var m: NvfsMachine, data: Bytes, payload_start: Int,
+                capacity: Int) -> NvfsProgress []
+    let handle = read_handle(m.op)
+    let pos = handle_position_of(m, handle)
+    let block_start = m.walk_index * capacity
+    let from = clamp(pos - block_start, capacity)
+    let to = clamp(m.read_to - block_start, capacity)
+    if pos < 0
+        // cov: skip — the handle is checked before the chain's walk, and nothing in that walk closes it.
+        broken(var m, NvfsNotFound)
+    elif to <= from
+        // cov: skip — the arrival is at the block the read's start index names and `read_to` is past the cursor there, so `to` is always above `from`.
+        finished(var m, NvfsData(bytes.zeros(0)))
+    else
+        handle_move_to(var m, handle, block_start + to)
+        finished(var m, NvfsData(bytes.slice(data, payload_start + from, payload_start + to)))
+
+// A write through a handle.  An inline file is one record; a chain would
+// need a block per addition.
+@tier(app)
+fn write_file(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, handle: Int,
+              data: Bytes) -> NvfsProgress []
+    let pos = handle_position_of(m, handle)
+    if pos < 0
+        // cov: skip — `handle_start` refuses a handle the machine does not hold before the walk begins.
+        broken(var m, NvfsNotFound)
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) =>
+                if nvfsvol.entry_is_directory(e)
+                    broken(var m, NvfsIsDirectory)
+                elif not nvfsctz.is_inline(nvfsvol.entry_size(e), name_bound(m))
+                    // Growing a chain means allocating a block, which
+                    // means knowing which blocks nothing reaches — the
+                    // same walk the mkdir arm names.  Refused, and
+                    // named, rather than a file that loses its tail.
+                    broken(var m, NvfsNotSupported)
+                else
+                    write_inline(var m, handle, leaf, e, pos, data)
+
+// The inline case of a write: the new contents are one record.
+//
+// The three pieces are the prefix the write starts after, the bytes
+// written, and the tail it did not reach — so a write at a cursor
+// inside the file REPLACES the bytes it covers and leaves the rest of
+// the file where it was.  Keeping the tail is the reading of "write at
+// its cursor" under which a caller cannot lose bytes it never wrote
+// over; a caller that wants the file to end where the write ended asks
+// for the `NvfsTruncate` that says so.
+@tier(app)
+fn write_inline(var m: NvfsMachine, handle: Int, leaf: Str, e: nvfsvol.NvfsEntry, pos: Int,
+                data: Bytes) -> NvfsProgress []
+    let size = bytes.len(e.inline_data)
+    var content = bytes.slice(e.inline_data, 0, clamp(pos, size))
+    if pos > size
+        // A write past the end leaves a gap, and a gap on a format with
+        // no holes is zeros.
+        content = content + bytes.zeros(pos - size)
+    content = content + data
+    content = content + bytes.slice(e.inline_data, clamp(pos + bytes.len(data), size), size)
+    if bytes.len(content) > m.config.inline_max
+        // The file no longer fits inline and a chain cannot be built yet:
+        // no space this operation can use.
+        broken(var m, NvfsNoSpace)
+    else
+        m.pending = nvfsvol.encode_entry(nvfsvol.inline_entry(leaf, content))
+        handle_move_to(var m, handle, pos + bytes.len(data))
+        begin_commit(var m)
+
+// A truncation through a handle: an inline file is one record, shorter or
+// zero-padded longer.
+@tier(app)
+fn truncate_file(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, handle: Int,
+                 new_size: Int) -> NvfsProgress []
+    let pos = handle_position_of(m, handle)
+    if pos < 0
+        // cov: skip — `handle_start` refuses a handle the machine does not hold before the walk begins.
+        broken(var m, NvfsNotFound)
+    elif new_size < 0
+        broken(var m, NvfsInvalidConfig)
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) =>
+                if nvfsvol.entry_is_directory(e)
+                    broken(var m, NvfsIsDirectory)
+                elif not nvfsctz.is_inline(nvfsvol.entry_size(e), name_bound(m))
+                    broken(var m, NvfsNotSupported)
+                elif new_size > m.config.inline_max
+                    broken(var m, NvfsNoSpace)
+                else
+                    truncate_inline(var m, handle, leaf, e, pos, new_size)
+
+// The inline case of a truncation.
+@tier(app)
+fn truncate_inline(var m: NvfsMachine, handle: Int, leaf: Str, e: nvfsvol.NvfsEntry, pos: Int,
+                   new_size: Int) -> NvfsProgress []
+    let size = bytes.len(e.inline_data)
+    var content = bytes.clone(e.inline_data)
+    if new_size < size
+        content = bytes.slice(e.inline_data, 0, new_size)
+    elif new_size > size
+        content = content + bytes.zeros(new_size - size)
+    m.pending = nvfsvol.encode_entry(nvfsvol.inline_entry(leaf, content))
+    if pos > new_size
+        // A cursor past the new end would read nothing and write past the
+        // end, so it is pulled back to it.
+        handle_move_to(var m, handle, new_size)
+    begin_commit(var m)
+
+// A seek: arithmetic over the file's size, and the cursor moved.
+@tier(app)
+fn seek_file(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry], leaf: Str, handle: Int, off: Int,
+             whence: Int) -> NvfsProgress []
+    let pos = handle_position_of(m, handle)
+    if pos < 0
+        // cov: skip — `handle_start` refuses a handle the machine does not hold before the walk begins.
+        broken(var m, NvfsNotFound)
+    else
+        match nvfsvol.find(entries, leaf)
+            None    => broken(var m, NvfsNotFound)
+            Some(e) => seek_to(var m, handle, pos, off, whence, nvfsvol.entry_size(e))
+
+// The arithmetic of a seek, once the file's size is known.
+//
+// The three whence values are POSIX's: from the start, from the cursor,
+// from the end.  A target before the start is clamped to the start, and a
+// whence outside 0, 1 and 2 leaves the cursor where it is rather than
+// guessing.
+@tier(app)
+fn seek_to(var m: NvfsMachine, handle: Int, pos: Int, off: Int, whence: Int,
+           size: Int) -> NvfsProgress []
+    var target = pos
+    match whence
+        0 =>
+            target = off
+        1 =>
+            target = pos + off
+        2 =>
+            target = size + off
+        _ => ()
+    if target < 0
+        target = 0
+    handle_move_to(var m, handle, target)
+    finished(var m, NvfsPosition(target))
+
+// Whether a value is inside [0, hi].
+@tier(app)
+fn clamp(v: Int, hi: Int) -> Int []
+    if v < 0
+        // cov: skip — `clamp` is private and every caller has already refused a negative value, so the value is never below zero.
+        0
+    elif v > hi
+        hi
+    else
+        v
+
+// ---------------------------------------------------------------------------
+// Commits.
+// ---------------------------------------------------------------------------
+
+// The record type an operation's commit writes.
+//
+// Read off the operation rather than carried in a field, because the
+// phase that programs it needs the type and nothing else: the payload is
+// `pending`.
+@tier(app)
+fn op_record_type(op: NvfsOp) -> Int []
+    match op
+        NvfsRemove(_)    => nvfsvol.record_type_tombstone()
+        NvfsRename(_, _) => nvfsvol.record_type_rename()
+        _                => nvfsvol.record_type_entry()
+
+// Start the commit a walk has prepared: append the record at the log's
+// tail, or compact when it does not fit there.
+//
+// `nvfsgeo.append_fits` is the strict predicate and it is the one that
+// decides BETWEEN the two, so a record whose padded span ends exactly at
+// the block's last byte compacts rather than appending.
+@tier(app)
+fn begin_commit(var m: NvfsMachine) -> NvfsProgress []
+    if nvfsgeo.append_fits(m.geometry.block_size, m.geometry.prog_size,
+                           m.walk_target, bytes.len(m.pending))
+        m.staged = nvfsmeta.append_image(
+            nvfsmeta.record(op_record_type(m.op), m.pending), m.geometry.prog_size)
+        enter(var m, 3)
+    else
+        // The tail is full, so the commit goes through the sibling: the
+        // read step (state 5) is what brings the records back into hand.
+        enter(var m, 5)
+
+// A commit's phases.
+@tier(app)
+fn advance_commit(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    match m.phase
+        3 =>
+            // The program landed.  One sync before the commit is reported,
+            // because a program the device buffered is not a program on the
+            // part.
+            enter(var m, 4)
+        4 => finish_commit(var m)
+        5 =>
+            // The active block, with the new record applied to it.  The
+            // compaction is LOSSY ON PURPOSE: `compaction_records` folds the
+            // log into one record per live name, which is what keeps a
+            // directory rewritten a thousand times from needing a
+            // thousand-record block.
+            let scan = scan_of(m, data)
+            var records = nvfsmeta.scan_records(scan)
+            records = list.push(records, nvfsmeta.record(op_record_type(m.op), m.pending))
+            let live = nvfsvol.compaction_records(records)
+            if not nvfsmeta.compaction_fits(live, m.geometry.prog_size, m.geometry.block_size)
+                broken(var m, NvfsNoSpace)
+            else
+                m.staged = nvfsmeta.compaction_image(live, m.geometry.prog_size)
+                // The seal's revision is the winner's plus one, which is what
+                // makes the block being written win the next arbitration.  It
+                // rides in `cursor` because the seal is three phases away and
+                // nothing else needs the field until the operation is over.
+                m.cursor = nvfswear.next_revision(nvfsmeta.scan_revision(scan))
+                enter(var m, 6)
+        6 => enter(var m, 7)
+        7 =>
+            // The records, then the seal — never one program, because the gap
+            // between them is the power-loss window the format is built
+            // around.
+            enter(var m, 8)
+        _ =>
+            // The seal landed: the compaction is complete and the new block
+            // is the active one.
+            m.pair = nvfsmeta.pair(m.pair.second, m.pair.first)
+            enter(var m, 4)
+
+// The answer a finished commit reports.
+//
+// A created file's handle is opened HERE rather than where the walk
+// decided, because the record may still fail to write: a handle opened
+// for a file that does not exist would be the machine lying about state it
+// never reached.
+@tier(app)
+fn finish_commit(var m: NvfsMachine) -> NvfsProgress []
+    match m.op
+        NvfsOpen(_, _)     => finished(var m, NvfsHandle(handle_open(var m, op_path(m.op))))
+        NvfsWrite(_, data) => finished(var m, NvfsWritten(bytes.len(data)))
+        _                  => finished(var m, NvfsCompleted)
+
+// ---------------------------------------------------------------------------
+// Check: one pass over every block of the device.
+// ---------------------------------------------------------------------------
+
+// A check's phases.
+//
+// The pass is per BLOCK rather than per pair, because a check is asking
+// what the bytes say: every block is read, and a block that still holds
+// anything is a block the volume uses.  That definition is the one that
+// survives damage — a torn block, a half-erased block and a block written
+// by a version that no longer exists are all "used", which is the answer
+// that never hands a live block to an allocator.
+@tier(app)
+fn advance_check(var m: NvfsMachine, data: Bytes) -> NvfsProgress []
+    if m.phase != 11
+        // cov: skip — a check's only read phase is 11, and nothing else answers bytes to a check.
+        broken(var m, NvfsCorrupt)
+    else
+        tally_block(var m, data)
+        if m.cursor + 1 < m.geometry.block_count
+            m.cursor = m.cursor + 1
+            enter(var m, 11)
+        else
+            check_report(var m)
+
+// What one block of a check's pass found.
+@tier(app)
+fn tally_block(var m: NvfsMachine, data: Bytes) []
+    if not image_is_blank(data)
+        m.walk_block = m.walk_block + 1
+        let scan = scan_of(m, data)
+        if nvfsmeta.scan_torn(scan)
+            m.problems = list.push(m.problems, "block " + "${m.cursor}"
+                + " ends in garbage: a program was interrupted, or the block changed under a write")
+        if nvfsmeta.scan_valid(scan)
+            let revision = nvfsmeta.scan_revision(scan)
+            if revision > m.walk_target
+                m.walk_target = revision
+            let complaint = superblock_complaint(nvfsmeta.scan_records(scan), m.geometry)
+            if complaint != ""
+                m.problems = list.push(m.problems, "block " + "${m.cursor}" + ": " + complaint)
+            tally_entries(var m, nvfsvol.fold(nvfsmeta.scan_records(scan)))
+
+// Whether a block holds nothing at all.
+//
+// "Free" here is "entirely erased", which is the only definition a single
+// pass can check: a block is free exactly when a program to it would be
+// legal, and NOR programming only clears bits, so an erased block is the
+// only block that can take a write without an erase first.
+@tier(app)
+fn image_is_blank(b: Bytes) -> Bool []
+    var blank = true
+    var i = 0
+    while blank and i < bytes.len(b)
+        let v = bytes.byte_at(b, i) ?? 0
+        if v != nvfsgeo.erased_byte()
+            blank = false
+        i = i + 1
+    blank
+
+// The report a finished check answers.
+//
+// The identity `blocks_used + blocks_free == block_count` holds by
+// construction, and the only way to break it is for the count to exceed
+// the device — which cannot be repaired by arithmetic, so it is reported
+// instead.
+@tier(app)
+fn check_report(var m: NvfsMachine) -> NvfsProgress []
+    let used = m.walk_block
+    var free = m.geometry.block_count - used
+    if free < 0
+        free = 0
+        m.problems = list.push(m.problems, "more blocks are in use than the device holds")
+    finished(var m, NvfsChecked(NvfsReport {
+        blocks_used: used, blocks_free: free, files: m.walk_index,
+        directories: m.directories, max_revision: m.walk_target,
+        problems: m.problems[:] }))
+
+// What is wrong with the superblock a block's log carries, and the empty
+// string when nothing is.
+//
+// This is the accounting check: the superblock carries the counts the
+// volume was built for, and a device whose geometry disagrees with them is
+// one a mount refuses.  A check has to REPORT it rather than refuse,
+// because the report is the thing a user reads before deciding what to do
+// — and these are the numbers a truncated device, a copy at the wrong
+// offset and an image built for another part all get wrong.
+@tier(app)
+fn superblock_complaint(records: [nvfsmeta.NvfsRecord], g: nvfsvol.NvfsGeometry) -> Str []
+    match nvfsvol.find_superblock(records)
+        None          => ""
+        Some(payload) =>
+            match nvfsvol.decode_superblock(payload)
+                Err(_) => "the superblock record does not decode"
+                Ok(sb) =>
+                    if nvfsvol.geometry_matches(sb, g)
+                        ""
+                    else
+                        "the superblock describes a " + "${sb.block_count}"
+                            + "-block device of " + "${sb.block_size}"
+                            + "-byte blocks; this one has " + "${g.block_count}"
+                            + " of " + "${g.block_size}"
+
+// Whether an entry names a chain.
+@tier(app)
+fn kind_is_chain(k: nvfsvol.NvfsEntryKind) -> Bool []
+    match k
+        NvfsKindChain => true
+        _             => false
+
+// What is wrong with one entry, and the empty string when nothing is.
+@tier(app)
+fn entry_complaint(e: nvfsvol.NvfsEntry, g: nvfsvol.NvfsGeometry, file_max: Int) -> Str []
+    if nvfsvol.entry_is_directory(e)
+        if nvfsvol.entry_pair_is_plausible(e, g.block_count)
+            ""
+        else
+            "names a pair outside the device"
+    elif nvfsvol.entry_size(e) > file_max
+        "is larger than this volume allows"
+    elif kind_is_chain(e.kind) and not nvfsctz.pointer_is_plausible(e.word_first, g.block_count)
+        "names a chain head outside the device"
+    else
+        ""
+
+// The entries one block's log holds, counted and held to their bounds.
+@tier(app)
+fn tally_entries(var m: NvfsMachine, entries: [nvfsvol.NvfsEntry]) []
+    for i in 0..list.len(entries)
+        let e = list.get(entries, i, nvfsvol.inline_entry("", bytes.zeros(0)))
+        if nvfsvol.entry_is_directory(e)
+            m.directories = m.directories + 1
+        else
+            m.walk_index = m.walk_index + 1
+        let complaint = entry_complaint(e, m.geometry, m.config.file_max)
+        if complaint != ""
+            m.problems = list.push(m.problems, "the entry '" + e.name + "' " + complaint)

@@ -1,8 +1,6 @@
 // nvfsvol.nv — what a record MEANS: the superblock, the directory
 // entries, and the fold that turns a log into a directory.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // NOT IN THE DEVICE CLAIM.  An entry holds a name and, for a small
 // file, its contents; a fold answers a list of them.  Both allocate.
 //
@@ -34,6 +32,7 @@
 
 use nvfsgeo
 use nvfsmeta
+use nvfswear
 
 // The device this volume is formatted for.
 //
@@ -112,6 +111,155 @@ pub struct NvfsEntry
     // An inline file's contents, and empty for every other kind.
     inline_data: Bytes
 
+// The one byte a kind is written as.
+//
+// Private because the number is an on-disk constant and not a thing a
+// caller acts on: `decode_entry` is its only other reader, so the
+// encode and the decode cannot disagree about what a kind is.
+@tier(app)
+fn entry_kind_byte(kind: NvfsEntryKind) -> Int []
+    match kind
+        NvfsKindDirectory => 1
+        NvfsKindInline    => 2
+        NvfsKindChain     => 3
+
+// The kind a byte names, or `None` when it names none of them.
+//
+// Through `entry_kind_byte` rather than against literals, so a kind
+// byte that is added later is written down once.
+@tier(app)
+fn entry_kind_from_byte(b: Int) -> ?NvfsEntryKind []
+    match b
+        _ if b == entry_kind_byte(NvfsKindDirectory) => Some(NvfsKindDirectory)
+        _ if b == entry_kind_byte(NvfsKindInline)    => Some(NvfsKindInline)
+        _ if b == entry_kind_byte(NvfsKindChain)     => Some(NvfsKindChain)
+        _                                            => None
+
+// Whether a superblock payload carries this format's magic.
+//
+// Four comparisons rather than a buffer comparison, because the magic
+// is published as a byte-at-a-time function: `nvfsgeo.magic_byte` is
+// what a device compares without a buffer, and this reads the same
+// four bytes out of the payload.
+@tier(app)
+fn magic_matches(payload: Bytes) -> Bool []
+    var same = true
+    for i in 0..4
+        if (bytes.byte_at(payload, i) ?? 0) != nvfsgeo.magic_byte(i)
+            same = false
+    same
+
+// The fold's upsert: the entry the name denotes is REPLACED in place,
+// which is what keeps a listing's order stable while its log grows.
+//
+// A name the list does not hold is appended, so the first record that
+// names something decides where it sits and every later record for the
+// same name only changes what it holds.
+@tier(app)
+fn fold_put(entries: [NvfsEntry], e: NvfsEntry) -> [NvfsEntry] []
+    var out: [NvfsEntry] = []
+    var replaced = false
+    for old in entries
+        if old.name == e.name
+            out = list.push(out, e)
+            replaced = true
+        else
+            out = list.push(out, old)
+    if not replaced
+        out = list.push(out, e)
+    out
+
+// The fold's remove: every entry but the one the name denotes.
+//
+// A name nothing holds removes nothing, which is why a tombstone for an
+// absent name is not an error — it is what a delete of a name that was
+// already deleted looks like after a power cut.
+@tier(app)
+fn fold_remove(entries: [NvfsEntry], name: Str) -> [NvfsEntry] []
+    var out: [NvfsEntry] = []
+    for e in entries
+        if e.name != name
+            out = list.push(out, e)
+    out
+
+// The fold's move: the entry the old name denotes, re-named, in the
+// position it already had.
+//
+// The entry keeps what it held and only its name changes, which is the
+// property that makes a rename one record: there is no moment at which
+// the directory holds a name with nothing under it.
+@tier(app)
+fn rename_in(entries: [NvfsEntry], old_name: Str, new_name: Str) -> [NvfsEntry] []
+    var out: [NvfsEntry] = []
+    var renamed = false
+    for e in entries
+        if not renamed and e.name == old_name
+            let moved = NvfsEntry { name: new_name, kind: e.kind, word_first: e.word_first,
+                                    word_second: e.word_second, inline_data: e.inline_data }
+            out = list.push(out, moved)
+            renamed = true
+        else
+            out = list.push(out, e)
+    out
+
+// The fold's move, out of a rename record's payload.
+//
+// The two lengths are one byte each and the payload is untrusted: a
+// payload that passed its CRC can still have lengths that do not
+// describe the bytes that follow them, and one that does not moves
+// nothing rather than slicing off the end of the buffer.
+@tier(app)
+fn fold_rename(entries: [NvfsEntry], payload: Bytes) -> [NvfsEntry] []
+    let n = bytes.len(payload)
+    let old_len = bytes.byte_at(payload, 0) ?? 0
+    let new_at = 1 + old_len + 1
+    let new_len = bytes.byte_at(payload, new_at - 1) ?? 0
+    let end = new_at + new_len
+    if old_len == 0 or new_len == 0 or new_at > n or end > n
+        // A copy, because the answer is a list the caller may write
+        // and the one that came in is the caller's.
+        entries[:]
+    else
+        let old_name = bytes.to_str(bytes.slice(payload, 1, 1 + old_len))
+        let new_name = bytes.to_str(bytes.slice(payload, new_at, end))
+        rename_in(entries, old_name, new_name)
+
+// The superblock record a log carries, as a one-record list, or none.
+//
+// Split out of `compaction_records` so the fold and the compaction
+// agree on where the superblock sits: at the head of the log a
+// compaction writes.
+@tier(app)
+fn superblock_records(records: [nvfsmeta.NvfsRecord]) -> [nvfsmeta.NvfsRecord] []
+    match find_superblock(records)
+        None    => []
+        Some(p) => [nvfsmeta.record(record_type_superblock(), p)]
+
+// Every component but the last, which is what "the directory this name
+// lives in" is when the two are compared.
+@tier(app)
+fn without_last(parts: [Str]) -> [Str] []
+    var out: [Str] = []
+    let n = list.len(parts)
+    for i in 0..n
+        if i + 1 < n
+            out = list.push(out, list.get(parts, i, ""))
+    out
+
+// Whether two component lists are the same list, compared element by
+// element — `==` on two lists of `Str` is not a comparison this module
+// can lean on for a path, because the two sides are built separately.
+@tier(app)
+fn same_components(a: [Str], b: [Str]) -> Bool []
+    if list.len(a) != list.len(b)
+        false
+    else
+        var same = true
+        for i in 0..list.len(a)
+            if list.get(a, i, "") != list.get(b, i, "")
+                same = false
+        same
+
 // The configuration a format uses when the caller does not say.
 //
 // ```novo
@@ -120,8 +268,13 @@ pub struct NvfsEntry
 // fn main() [io]
 //     println("${nvfsvol.default_config().inline_max}")
 // ```
-pub fn default_config() -> NvfsConfig []
-    todo("nvfs-core.nvfsvol.default_config")
+pub @tier(app)
+fn default_config() -> NvfsConfig []
+    // Relocate every hundred compactions, the same threshold littlefs
+    // defaults to: often enough that a hot directory does not wear out
+    // the two blocks it lives in, rare enough that the move is not
+    // most of the work.
+    NvfsConfig { block_cycles: 100, name_max: 255, file_max: 2147483647, inline_max: 128 }
 
 // A geometry.
 //
@@ -136,9 +289,10 @@ pub fn default_config() -> NvfsConfig []
 // fn main() [io]
 //     println("${nvfsvol.geometry(16, 16, 512, 32).block_count}")
 // ```
-pub fn geometry(read_size: Int, prog_size: Int, block_size: Int,
-                block_count: Int) -> NvfsGeometry []
-    todo("nvfs-core.nvfsvol.geometry")
+pub @tier(app)
+fn geometry(read_size: Int, prog_size: Int, block_size: Int, block_count: Int) -> NvfsGeometry []
+    NvfsGeometry { read_size: read_size, prog_size: prog_size,
+                   block_size: block_size, block_count: block_count }
 
 // A configuration.
 //
@@ -148,8 +302,10 @@ pub fn geometry(read_size: Int, prog_size: Int, block_size: Int,
 // fn main() [io]
 //     println("${nvfsvol.config(100, 64, 4096, 128).inline_max}")
 // ```
-pub fn config(block_cycles: Int, name_max: Int, file_max: Int, inline_max: Int) -> NvfsConfig []
-    todo("nvfs-core.nvfsvol.config")
+pub @tier(app)
+fn config(block_cycles: Int, name_max: Int, file_max: Int, inline_max: Int) -> NvfsConfig []
+    NvfsConfig { block_cycles: block_cycles, name_max: name_max,
+                 file_max: file_max, inline_max: inline_max }
 
 // A superblock, for a caller building one rather than reading one.
 //
@@ -159,9 +315,12 @@ pub fn config(block_cycles: Int, name_max: Int, file_max: Int, inline_max: Int) 
 // fn main() [io]
 //     println("${nvfsvol.superblock(65536, 512, 32, 64, 128, 4096, 100).block_size}")
 // ```
-pub fn superblock(version: Int, block_size: Int, block_count: Int, name_max: Int, inline_max: Int,
-                  file_max: Int, block_cycles: Int) -> NvfsSuperblock []
-    todo("nvfs-core.nvfsvol.superblock")
+pub @tier(app)
+fn superblock(version: Int, block_size: Int, block_count: Int, name_max: Int, inline_max: Int,
+              file_max: Int, block_cycles: Int) -> NvfsSuperblock []
+    NvfsSuperblock { version: version, block_size: block_size, block_count: block_count,
+                     name_max: name_max, inline_max: inline_max, file_max: file_max,
+                     block_cycles: block_cycles }
 
 // A volume, for a caller holding the four facts a mount answered.
 //
@@ -173,8 +332,9 @@ pub fn superblock(version: Int, block_size: Int, block_count: Int, name_max: Int
 //     let sb = nvfsvol.superblock(65536, 512, 32, 64, 128, 4096, 100)
 //     println("${nvfsvol.volume(g, sb, 1, 0).revision}")
 // ```
-pub fn volume(g: NvfsGeometry, sb: NvfsSuperblock, revision: Int, active: Int) -> NvfsVolume []
-    todo("nvfs-core.nvfsvol.volume")
+pub @tier(app)
+fn volume(g: NvfsGeometry, sb: NvfsSuperblock, revision: Int, active: Int) -> NvfsVolume []
+    NvfsVolume { geometry: g, superblock: sb, revision: revision, active: active }
 
 // Whether a configuration fits a geometry, and which error to answer
 // when it does not.
@@ -192,8 +352,25 @@ pub fn volume(g: NvfsGeometry, sb: NvfsSuperblock, revision: Int, active: Int) -
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println(nvfsgeo.error_name(nvfsvol.check_config(nvfsvol.default_config(), g)))
 // ```
-pub fn check_config(c: NvfsConfig, g: NvfsGeometry) -> nvfsgeo.NvfsError []
-    todo("nvfs-core.nvfsvol.check_config")
+pub @tier(app)
+fn check_config(c: NvfsConfig, g: NvfsGeometry) -> nvfsgeo.NvfsError []
+    // The name bound is a byte on disk, so 255 is a format limit rather
+    // than a taste: a caller asking for more would write a length that
+    // does not describe the name.  The inline bound is bounded by the
+    // same arithmetic `nvfsgeo.max_payload` answers, so a configuration
+    // cannot ask for an entry that no block holds.
+    if c.name_max < 1 or c.name_max > 255
+        NvfsInvalidConfig
+    elif c.inline_max < 0 or c.inline_max > nvfsgeo.max_payload(g.block_size, g.prog_size)
+        NvfsInvalidConfig
+    elif c.file_max < 1
+        NvfsInvalidConfig
+    elif not nvfswear.block_cycles_valid(c.block_cycles)
+        NvfsInvalidConfig
+    elif nvfsgeo.check_geometry(g.read_size, g.prog_size, g.block_size, g.block_count) != NvfsOk
+        NvfsInvalidConfig
+    else
+        NvfsOk
 
 // The superblock record's type byte.
 //
@@ -203,8 +380,9 @@ pub fn check_config(c: NvfsConfig, g: NvfsGeometry) -> nvfsgeo.NvfsError []
 // fn main() [io]
 //     println("${nvfsvol.record_type_superblock()}")
 // ```
-pub fn record_type_superblock() -> Int []
-    todo("nvfs-core.nvfsvol.record_type_superblock")
+pub @tier(app)
+fn record_type_superblock() -> Int []
+    1
 
 // The directory-entry record's type byte.
 //
@@ -214,8 +392,9 @@ pub fn record_type_superblock() -> Int []
 // fn main() [io]
 //     println("${nvfsvol.record_type_entry()}")
 // ```
-pub fn record_type_entry() -> Int []
-    todo("nvfs-core.nvfsvol.record_type_entry")
+pub @tier(app)
+fn record_type_entry() -> Int []
+    2
 
 // The tombstone record's type byte.
 //
@@ -225,8 +404,9 @@ pub fn record_type_entry() -> Int []
 // fn main() [io]
 //     println("${nvfsvol.record_type_tombstone()}")
 // ```
-pub fn record_type_tombstone() -> Int []
-    todo("nvfs-core.nvfsvol.record_type_tombstone")
+pub @tier(app)
+fn record_type_tombstone() -> Int []
+    3
 
 // The rename record's type byte.
 //
@@ -236,10 +416,16 @@ pub fn record_type_tombstone() -> Int []
 // fn main() [io]
 //     println("${nvfsvol.record_type_rename()}")
 // ```
-pub fn record_type_rename() -> Int []
-    todo("nvfs-core.nvfsvol.record_type_rename")
+pub @tier(app)
+fn record_type_rename() -> Int []
+    4
 
 // The superblock record's payload for this geometry and configuration.
+//
+// Eight four-byte words: the magic, the version this library writes,
+// and the geometry and the bounds a reader must respect.  The version
+// is the format's own rather than a parameter, which is what makes the
+// payload self-describing.
 //
 // ```novo
 // use std.bytes
@@ -249,8 +435,15 @@ pub fn record_type_rename() -> Int []
 //     let g = nvfsvol.geometry(16, 16, 512, 32)
 //     println("${bytes.len(nvfsvol.encode_superblock(g, nvfsvol.default_config()))}")
 // ```
-pub fn encode_superblock(g: NvfsGeometry, c: NvfsConfig) -> Bytes []
-    todo("nvfs-core.nvfsvol.encode_superblock")
+pub @tier(app)
+fn encode_superblock(g: NvfsGeometry, c: NvfsConfig) -> Bytes []
+    let magic = bytes.from_byte_list([nvfsgeo.magic_byte(0), nvfsgeo.magic_byte(1),
+                                      nvfsgeo.magic_byte(2), nvfsgeo.magic_byte(3)])
+    let version = bytes.u32_le(nvfsgeo.format_version())
+    let geometry_words = bytes.u32_le(g.block_size) + bytes.u32_le(g.block_count)
+    let bound_words = bytes.u32_le(c.name_max) + bytes.u32_le(c.inline_max)
+    let file_words = bytes.u32_le(c.file_max) + bytes.u32_le(nvfswear.encode_block_cycles(c.block_cycles))
+    magic + version + geometry_words + bound_words + file_words
 
 // A superblock payload read back, or the error that refuses it.
 //
@@ -269,8 +462,33 @@ pub fn encode_superblock(g: NvfsGeometry, c: NvfsConfig) -> Bytes []
 //         Err(_) => println("refused")
 //         Ok(sb) => println("${sb.block_size}")
 // ```
-pub fn decode_superblock(payload: Bytes) -> Result<NvfsSuperblock, nvfsgeo.NvfsError> []
-    todo("nvfs-core.nvfsvol.decode_superblock")
+pub @tier(app)
+fn decode_superblock(payload: Bytes) -> Result<NvfsSuperblock, nvfsgeo.NvfsError> []
+    // A payload is untrusted input: the length is checked before the
+    // magic is read, and every field is read with the bounds-checked
+    // accessor, so a short payload cannot be indexed past its end.
+    if bytes.len(payload) < 32
+        Err(NvfsCorrupt)
+    elif not magic_matches(payload)
+        Err(NvfsCorrupt)
+    else
+        let version = bytes.u32_le_at(payload, 4) ?? 0
+        if not nvfsgeo.version_is_mountable(version)
+            Err(NvfsVersionUnsupported)
+        else
+            // The block size and the block count are FOUR-BYTE fields
+            // read back into `Int`s; a device is the only thing that
+            // can say whether they are its own, which is why
+            // `geometry_matches` is a separate question.
+            let sb = NvfsSuperblock {
+                version: version,
+                block_size: bytes.u32_le_at(payload, 8) ?? 0,
+                block_count: bytes.u32_le_at(payload, 12) ?? 0,
+                name_max: bytes.u32_le_at(payload, 16) ?? 0,
+                inline_max: bytes.u32_le_at(payload, 20) ?? 0,
+                file_max: bytes.u32_le_at(payload, 24) ?? 0,
+                block_cycles: nvfswear.decode_block_cycles(bytes.u32_le_at(payload, 28) ?? 0) }
+            Ok(sb)
 
 // Whether a superblock describes the device it was read from.
 //
@@ -283,8 +501,14 @@ pub fn decode_superblock(payload: Bytes) -> Result<NvfsSuperblock, nvfsgeo.NvfsE
 //         Err(_) => println("refused")
 //         Ok(sb) => println("${nvfsvol.geometry_matches(sb, nvfsvol.geometry(16, 16, 512, 32))}")
 // ```
-pub fn geometry_matches(sb: NvfsSuperblock, g: NvfsGeometry) -> Bool []
-    todo("nvfs-core.nvfsvol.geometry_matches")
+pub @tier(app)
+fn geometry_matches(sb: NvfsSuperblock, g: NvfsGeometry) -> Bool []
+    // The block size and the block count, which are what the superblock
+    // stores.  The read and prog units are the device's own and are not
+    // on disk — they are how the device is spoken to, not what is
+    // stored, so a reader with a different page size reads the same
+    // image.
+    sb.block_size == g.block_size and sb.block_count == g.block_count
 
 // A directory entry naming a subdirectory's pair.
 //
@@ -294,8 +518,10 @@ pub fn geometry_matches(sb: NvfsSuperblock, g: NvfsGeometry) -> Bool []
 // fn main() [io]
 //     println(nvfsvol.directory_entry("logs", 4, 5).name)
 // ```
-pub fn directory_entry(name: Str, pair_first: Int, pair_second: Int) -> NvfsEntry []
-    todo("nvfs-core.nvfsvol.directory_entry")
+pub @tier(app)
+fn directory_entry(name: Str, pair_first: Int, pair_second: Int) -> NvfsEntry []
+    NvfsEntry { name: name, kind: NvfsKindDirectory, word_first: pair_first,
+                word_second: pair_second, inline_data: bytes.zeros(0) }
 
 // A directory entry holding a small file's whole contents.
 //
@@ -306,8 +532,10 @@ pub fn directory_entry(name: Str, pair_first: Int, pair_second: Int) -> NvfsEntr
 // fn main() [io]
 //     println(nvfsvol.inline_entry("boot", bytes.from_byte_list([1])).name)
 // ```
-pub fn inline_entry(name: Str, data: Bytes) -> NvfsEntry []
-    todo("nvfs-core.nvfsvol.inline_entry")
+pub @tier(app)
+fn inline_entry(name: Str, data: Bytes) -> NvfsEntry []
+    NvfsEntry { name: name, kind: NvfsKindInline, word_first: 0, word_second: 0,
+                inline_data: data }
 
 // A directory entry naming a file's CTZ chain and its size.
 //
@@ -317,8 +545,10 @@ pub fn inline_entry(name: Str, data: Bytes) -> NvfsEntry []
 // fn main() [io]
 //     println("${nvfsvol.chain_entry("big", 41, 4096).word_second}")
 // ```
-pub fn chain_entry(name: Str, head_block: Int, size: Int) -> NvfsEntry []
-    todo("nvfs-core.nvfsvol.chain_entry")
+pub @tier(app)
+fn chain_entry(name: Str, head_block: Int, size: Int) -> NvfsEntry []
+    NvfsEntry { name: name, kind: NvfsKindChain, word_first: head_block,
+                word_second: size, inline_data: bytes.zeros(0) }
 
 // A file's size in bytes; zero for a directory.
 //
@@ -328,8 +558,12 @@ pub fn chain_entry(name: Str, head_block: Int, size: Int) -> NvfsEntry []
 // fn main() [io]
 //     println("${nvfsvol.entry_size(nvfsvol.chain_entry("big", 41, 4096))}")
 // ```
-pub fn entry_size(e: NvfsEntry) -> Int []
-    todo("nvfs-core.nvfsvol.entry_size")
+pub @tier(app)
+fn entry_size(e: NvfsEntry) -> Int []
+    match e.kind
+        NvfsKindDirectory => 0
+        NvfsKindInline    => bytes.len(e.inline_data)
+        NvfsKindChain     => e.word_second
 
 // Whether an entry names a directory.
 //
@@ -339,8 +573,11 @@ pub fn entry_size(e: NvfsEntry) -> Int []
 // fn main() [io]
 //     println("${nvfsvol.entry_is_directory(nvfsvol.directory_entry("logs", 4, 5))}")
 // ```
-pub fn entry_is_directory(e: NvfsEntry) -> Bool []
-    todo("nvfs-core.nvfsvol.entry_is_directory")
+pub @tier(app)
+fn entry_is_directory(e: NvfsEntry) -> Bool []
+    match e.kind
+        NvfsKindDirectory => true
+        _                 => false
 
 // Whether an entry's pair words could name real blocks.
 //
@@ -355,10 +592,25 @@ pub fn entry_is_directory(e: NvfsEntry) -> Bool []
 // fn main() [io]
 //     println("${nvfsvol.entry_pair_is_plausible(nvfsvol.directory_entry("logs", 4, 5), 32)}")
 // ```
-pub fn entry_pair_is_plausible(e: NvfsEntry, block_count: Int) -> Bool []
-    todo("nvfs-core.nvfsvol.entry_pair_is_plausible")
+pub @tier(app)
+fn entry_pair_is_plausible(e: NvfsEntry, block_count: Int) -> Bool []
+    // Both ends of each word: a negative block is a read before the
+    // device and a word at or past the count is a read after it, and
+    // equal words are not a PAIR — a directory whose two halves are one
+    // block has no spare to compact into.
+    e.word_first >= 0
+        and e.word_first < block_count
+        and e.word_second >= 0
+        and e.word_second < block_count
+        and e.word_first != e.word_second
 
 // An entry's record payload.
+//
+// `[ kind u8 | name_len u8 | name | word_first u32 | word_second u32 |
+// inline_data ]`, little-endian as everything in this format is.  The
+// name length is ONE byte, which is where the superblock's `name_max`
+// bound of 255 comes from and why a caller validates a name before it
+// gets here.
 //
 // ```novo
 // use std.bytes
@@ -367,8 +619,12 @@ pub fn entry_pair_is_plausible(e: NvfsEntry, block_count: Int) -> Bool []
 // fn main() [io]
 //     println("${bytes.len(nvfsvol.encode_entry(nvfsvol.directory_entry("logs", 4, 5)))}")
 // ```
-pub fn encode_entry(e: NvfsEntry) -> Bytes []
-    todo("nvfs-core.nvfsvol.encode_entry")
+pub @tier(app)
+fn encode_entry(e: NvfsEntry) -> Bytes []
+    let name = bytes.from_str(e.name)
+    let head = bytes.u8(entry_kind_byte(e.kind)) + bytes.u8(bytes.len(name))
+    let words = bytes.u32_le(e.word_first) + bytes.u32_le(e.word_second)
+    head + name + words + e.inline_data
 
 // An entry payload read back, or `None` when the payload is shorter
 // than its own header claims.
@@ -387,10 +643,35 @@ pub fn encode_entry(e: NvfsEntry) -> Bytes []
 //         None    => println("not an entry")
 //         Some(e) => println(e.name)
 // ```
-pub fn decode_entry(payload: Bytes) -> ?NvfsEntry []
-    todo("nvfs-core.nvfsvol.decode_entry")
+pub @tier(app)
+fn decode_entry(payload: Bytes) -> ?NvfsEntry []
+    // Every length in the payload is attacker-controlled: the name
+    // length is a byte that could say 255 in a sixteen-byte payload,
+    // so the words are only read once the bytes they occupy are known
+    // to be there.
+    if bytes.len(payload) < 2
+        None
+    else
+        let kind_byte = bytes.byte_at(payload, 0) ?? 0
+        let name_len = bytes.byte_at(payload, 1) ?? 0
+        let words_at = 2 + name_len
+        if bytes.len(payload) < words_at + 8
+            None
+        else
+            match entry_kind_from_byte(kind_byte)
+                None       => None
+                Some(kind) =>
+                    let name = bytes.to_str(bytes.slice(payload, 2, words_at))
+                    let data = bytes.slice(payload, words_at + 8, bytes.len(payload))
+                    Some(NvfsEntry { name: name, kind: kind,
+                                     word_first: bytes.u32_le_at(payload, words_at) ?? 0,
+                                     word_second: bytes.u32_le_at(payload, words_at + 4) ?? 0,
+                                     inline_data: data })
 
 // A tombstone's record payload.
+//
+// The name, and nothing else: the record's own type says what it means,
+// so the payload has no room for a second opinion about it.
 //
 // ```novo
 // use std.bytes
@@ -399,8 +680,9 @@ pub fn decode_entry(payload: Bytes) -> ?NvfsEntry []
 // fn main() [io]
 //     println("${bytes.len(nvfsvol.encode_tombstone("boot"))}")
 // ```
-pub fn encode_tombstone(name: Str) -> Bytes []
-    todo("nvfs-core.nvfsvol.encode_tombstone")
+pub @tier(app)
+fn encode_tombstone(name: Str) -> Bytes []
+    bytes.from_str(name)
 
 // A rename's record payload: both names, in one record.
 //
@@ -411,8 +693,11 @@ pub fn encode_tombstone(name: Str) -> Bytes []
 // fn main() [io]
 //     println("${bytes.len(nvfsvol.encode_rename("boot", "boot.old"))}")
 // ```
-pub fn encode_rename(old_name: Str, new_name: Str) -> Bytes []
-    todo("nvfs-core.nvfsvol.encode_rename")
+pub @tier(app)
+fn encode_rename(old_name: Str, new_name: Str) -> Bytes []
+    let old = bytes.from_str(old_name)
+    let new = bytes.from_str(new_name)
+    bytes.u8(bytes.len(old)) + old + bytes.u8(bytes.len(new)) + new
 
 // A directory's live entries: the fold over its log, in order.
 //
@@ -427,8 +712,27 @@ pub fn encode_rename(old_name: Str, new_name: Str) -> Bytes []
 // fn main() [io]
 //     println("${list.len(nvfsvol.fold([]))}")
 // ```
-pub fn fold(records: [nvfsmeta.NvfsRecord]) -> [NvfsEntry] []
-    todo("nvfs-core.nvfsvol.fold")
+pub @tier(app)
+fn fold(records: [nvfsmeta.NvfsRecord]) -> [NvfsEntry] []
+    var entries: [NvfsEntry] = []
+    for r in records
+        let t = r.rtype
+        match t
+            _ if t == record_type_entry()     =>
+                // A record that passed its CRC and does not decode is not
+                // an entry: folding it would put a name the walk cannot
+                // read into the listing.
+                if let Some(e) = decode_entry(r.payload)
+                    entries = fold_put(entries, e)
+            _ if t == record_type_tombstone() =>
+                entries = fold_remove(entries, bytes.to_str(r.payload))
+            _ if t == record_type_rename()    =>
+                entries = fold_rename(entries, r.payload)
+            _                                 => ()
+        // The superblock and any type this version does not know are
+        // not directory state, and a fold that guessed at one would be
+        // reading a record with the wrong decoder.
+    entries
 
 // The entry a name denotes, or `None`.
 //
@@ -440,8 +744,12 @@ pub fn fold(records: [nvfsmeta.NvfsRecord]) -> [NvfsEntry] []
 //         None    => println("not found")
 //         Some(e) => println(e.name)
 // ```
-pub fn find(entries: [NvfsEntry], name: Str) -> ?NvfsEntry []
-    todo("nvfs-core.nvfsvol.find")
+pub @tier(app)
+fn find(entries: [NvfsEntry], name: Str) -> ?NvfsEntry []
+    for e in entries
+        if e.name == name
+            return Some(e)
+    None
 
 // The superblock payload a log carries, or `None`.
 //
@@ -457,8 +765,15 @@ pub fn find(entries: [NvfsEntry], name: Str) -> ?NvfsEntry []
 //         None    => println("not the root")
 //         Some(_) => println("the root")
 // ```
-pub fn find_superblock(records: [nvfsmeta.NvfsRecord]) -> ?Bytes []
-    todo("nvfs-core.nvfsvol.find_superblock")
+pub @tier(app)
+fn find_superblock(records: [nvfsmeta.NvfsRecord]) -> ?Bytes []
+    for r in records
+        if r.rtype == record_type_superblock()
+            // A copy, because the caller keeps the payload after the
+            // log it came out of is gone — a compaction is exactly
+            // that.
+            return Some(bytes.clone(r.payload))
+    None
 
 // The record set a compaction must preserve: the superblock, if the
 // log has one, and one entry record per live entry.
@@ -473,8 +788,15 @@ pub fn find_superblock(records: [nvfsmeta.NvfsRecord]) -> ?Bytes []
 // fn main() [io]
 //     println("${list.len(nvfsvol.compaction_records([]))}")
 // ```
-pub fn compaction_records(records: [nvfsmeta.NvfsRecord]) -> [nvfsmeta.NvfsRecord] []
-    todo("nvfs-core.nvfsvol.compaction_records")
+pub @tier(app)
+fn compaction_records(records: [nvfsmeta.NvfsRecord]) -> [nvfsmeta.NvfsRecord] []
+    // The fold is what makes a compaction LOSSY ON PURPOSE: a name
+    // written ten times becomes one record and a name removed becomes
+    // none, so the log that comes out is the same directory with a
+    // shorter history.
+    var out = superblock_records(records)
+    out = list.concat(out, list.map(fold(records), e => nvfsmeta.record(record_type_entry(), encode_entry(e))))
+    out
 
 // A path split into components, with empty ones dropped.
 //
@@ -488,8 +810,13 @@ pub fn compaction_records(records: [nvfsmeta.NvfsRecord]) -> [nvfsmeta.NvfsRecor
 // fn main() [io]
 //     println("${nvfsvol.path_components("/a//b/")}")
 // ```
-pub fn path_components(path: Str) -> [Str] []
-    todo("nvfs-core.nvfsvol.path_components")
+pub @tier(app)
+fn path_components(path: Str) -> [Str] []
+    var out: [Str] = []
+    for part in str.split(path, "/")
+        if part != ""
+            out = list.push(out, part)
+    out
 
 // A path's last component, and the empty string for the root.
 //
@@ -499,8 +826,23 @@ pub fn path_components(path: Str) -> [Str] []
 // fn main() [io]
 //     println(nvfsvol.basename("/a/b"))
 // ```
-pub fn basename(path: Str) -> Str []
-    todo("nvfs-core.nvfsvol.basename")
+pub @tier(app)
+fn basename(path: Str) -> Str []
+    let parts = path_components(path)
+    let n = list.len(parts)
+    if n == 0
+        // The root, or a path that names nothing: there is no last
+        // component, and the empty string is not a name a caller can
+        // mistake for one.
+        ""
+    else
+        // The name is bound before it is answered, rather than the
+        // `list.get` standing as the branch's value, because on the
+        // LLVM backend a `list.get` in that slot answers `""` here —
+        // neither the element nor its own default.  The binding is the
+        // workaround.
+        let last = list.get(parts, n - 1, "")
+        last
 
 // Whether a name is one this volume accepts.
 //
@@ -516,8 +858,15 @@ pub fn basename(path: Str) -> Str []
 // fn main() [io]
 //     println("${nvfsvol.name_is_valid("boot", 64)}")
 // ```
-pub fn name_is_valid(name: Str, name_max: Int) -> Bool []
-    todo("nvfs-core.nvfsvol.name_is_valid")
+pub @tier(app)
+fn name_is_valid(name: Str, name_max: Int) -> Bool []
+    // The length is BYTES, the same unit the payload stores it in, so
+    // a name that fits here fits the record.  A separator is refused
+    // because a name is one component and a path is several: letting
+    // one through would let a lookup escape its directory.
+    str.len(name) > 0
+        and str.len(name) <= name_max
+        and not str.contains(name, "/")
 
 // Whether two paths name entries in the same directory.
 //
@@ -531,5 +880,10 @@ pub fn name_is_valid(name: Str, name_max: Int) -> Bool []
 // fn main() [io]
 //     println("${nvfsvol.same_parent("/a/b", "/a/c")}")
 // ```
-pub fn same_parent(old_path: Str, new_path: Str) -> Bool []
-    todo("nvfs-core.nvfsvol.same_parent")
+pub @tier(app)
+fn same_parent(old_path: Str, new_path: Str) -> Bool []
+    // The components up to the last one, compared as lists: `/a/b` and
+    // `/a/c` are both in `/a`, and `/a/b` and `/a/c/d` are not in the
+    // same directory at any depth.
+    same_components(without_last(path_components(old_path)),
+                    without_last(path_components(new_path)))

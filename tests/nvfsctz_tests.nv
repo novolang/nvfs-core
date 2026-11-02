@@ -1,9 +1,6 @@
 // nvfsctz_tests.nv — the skip-list, as arithmetic that can be checked
 // without a device.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: nvfs-core.nvfsctz.<fn>`.
-//
 // THE O(log n) CLAIM IS ASSERTED, NOT DESCRIBED.  A skip list whose
 // seek is linear is still correct and is the bug worth catching, and
 // `seek_reads` is the number that catches it: a hundred-thousand-block
@@ -89,7 +86,7 @@ fn test_a_walk_is_three_integers_and_a_jump_at_a_time() [io]
     let w = nvfsctz.walk(41, 9, 1)
     test.assert(nvfsctz.walk_block(w) == 41)
     test.assert(nvfsctz.walk_index(w) == 9)
-    test.assert(nvfsctz.walk_done(w) == false)
+    test.assert(not nvfsctz.walk_done(w))
 
     test.case("a walk that has arrived has arrived")
     test.assert(nvfsctz.walk_done(nvfsctz.walk(41, 9, 9)))
@@ -115,10 +112,10 @@ fn test_a_corrupt_pointer_is_caught_before_it_reads_block_four_billion() [io]
     test.assert(nvfsctz.pointer_is_plausible(33, 256))
 
     test.case("one past the end is not")
-    test.assert(nvfsctz.pointer_is_plausible(256, 256) == false)
+    test.assert(not nvfsctz.pointer_is_plausible(256, 256))
 
     test.case("and neither is the absent marker, which is what an unwritten slot reads as")
-    test.assert(nvfsctz.pointer_is_plausible(nvfsctz.absent_pointer(), 256) == false)
+    test.assert(not nvfsctz.pointer_is_plausible(nvfsctz.absent_pointer(), 256))
 
     test.case("the absent marker is the erased word, so a slot needs no second pass")
     test.assert(nvfsctz.absent_pointer() == 4294967295)
@@ -130,7 +127,7 @@ fn test_a_small_file_costs_no_data_block_at_all() [io]
     test.assert(nvfsctz.is_inline(128, 128))
 
     test.case("past it, it is a chain")
-    test.assert(nvfsctz.is_inline(129, 128) == false)
+    test.assert(not nvfsctz.is_inline(129, 128))
 
     test.case("and an empty file is always inline")
     test.assert(nvfsctz.is_inline(0, 128))
@@ -144,7 +141,60 @@ fn test_a_shrink_reuses_the_chain_prefix_because_a_prefix_is_a_chain() [io]
     test.assert(nvfsctz.shrink_reuses_prefix(1000, 500, 480, 128))
 
     test.case("a shrink into the inline range does not — it becomes a different kind")
-    test.assert(nvfsctz.shrink_reuses_prefix(1000, 64, 480, 128) == false)
+    test.assert(not nvfsctz.shrink_reuses_prefix(1000, 64, 480, 128))
 
     test.case("and an EXTENSION is not a shrink")
-    test.assert(nvfsctz.shrink_reuses_prefix(500, 1000, 480, 128) == false)
+    test.assert(not nvfsctz.shrink_reuses_prefix(500, 1000, 480, 128))
+
+@test
+fn test_a_geometry_that_cannot_hold_a_chain_answers_zero_rather_than_dividing() [io]
+    // Every one of these is a number from a caller's geometry or from
+    // an image that is being read, and each would be a division by a
+    // value that has no answer if it were used.
+    test.case("a block smaller than its own pointer slots holds no payload")
+    test.assert(nvfsctz.capacity(8, 32) == 0)
+    test.assert(nvfsctz.capacity(512, 32) > 0)
+
+    test.case("a negative offset is before the chain, and lands on its first byte")
+    test.assert(nvfsctz.index_of_offset(0 - 1, 480) == 0)
+    test.assert(nvfsctz.offset_in_block(0 - 1, 480) == 0)
+
+    test.case("a capacity of zero divides nothing")
+    test.assert(nvfsctz.index_of_offset(1000, 0) == 0)
+    test.assert(nvfsctz.offset_in_block(1000, 0) == 0)
+
+    test.case("a slot number below zero is not a slot, and slot zero is")
+    test.assert(nvfsctz.pointer_offset(0 - 1) == 0)
+    test.assert(nvfsctz.pointer_offset(0) == 0)
+    test.assert(nvfsctz.pointer_offset(3) == 12)
+
+@test
+fn test_a_jump_of_nothing_moves_nowhere_and_a_slot_past_sixty_two_reaches_as_far_as_one_can() [io]
+    // A walk that has arrived asks for a jump of -1, and the answer has
+    // to be "stay here" rather than a shift by a negative number.
+    test.case("a jump of -1 lands on the block the walk is already on")
+    test.assert(nvfsctz.pointer_target(9, 0 - 1) == 9)
+    test.assert(nvfsctz.pointer_target(0, 0 - 1) == 0)
+
+    test.case("a shift past what an Int holds reaches the same distance as the largest one")
+    test.assert(nvfsctz.pointer_target(200, 63) == 200 - (1 << 62))
+    test.assert(nvfsctz.pointer_target(200, 62) == 200 - (1 << 62))
+    test.assert(nvfsctz.pointer_target(200, 900) == 200 - (1 << 62))
+
+    test.case("and the walk that arrived is unmoved by the -1 the jump answered")
+    let w = nvfsctz.walk(41, 9, 9)
+    let stayed = nvfsctz.walk_step(w, 0 - 1, 33)
+    test.assert(nvfsctz.walk_index(stayed) == nvfsctz.walk_index(w))
+    test.assert(nvfsctz.walk_block(stayed) == nvfsctz.walk_block(w))
+    test.assert(nvfsctz.walk_done(stayed))
+
+    test.case("while a real jump moves the walk without changing its target")
+    // `walk_done` asks whether the index has come down to the target,
+    // so a walk built for 0 and stepped to index 1 is still seeking.
+    let deep = nvfsctz.walk(41, 9, 0)
+    test.assert(not nvfsctz.walk_done(deep))
+    let moved = nvfsctz.walk_step(deep, 3, 33)
+    test.assert(nvfsctz.walk_index(moved) == 9 - 8)
+    test.assert(nvfsctz.walk_block(moved) == 33)
+    test.assert(not nvfsctz.walk_done(moved))
+    test.assert(nvfsctz.walk_done(nvfsctz.walk_step(moved, 0, 34)))

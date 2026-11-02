@@ -1,7 +1,5 @@
 // nvfsctz.nv — the CTZ skip-list, as arithmetic over block numbers.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS PART OF THE DEVICE CLAIM.  A seek into a file is the
 // one operation a firmware does in a loop, and it is entirely
 // integers: which block index holds byte `off`, which skip pointer to
@@ -32,6 +30,8 @@
 // here, it is named in the README, and `capacity` is the one function
 // that would change if it were revisited.
 
+use nvfsgeo
+
 // A walk through a chain, in progress.
 //
 // Three integers and no allocation: where the walk is now, which chain
@@ -61,7 +61,18 @@ struct NvfsCtzWalk
 //     println("${nvfsctz.pointer_count(256)}")
 // ```
 pub fn pointer_count(block_count: Int) -> Int []
-    todo("nvfs-core.nvfsctz.pointer_count")
+    // One at least, because a device with a single block still has a
+    // block and K of zero would be a data offset with no slots in
+    // front of it.  The loop runs once per bit above the lowest, so
+    // its bound is the widest an `Int` holds; a block count a device
+    // could actually have stops at its own width.
+    var count = 1
+    var rest = block_count - 1
+    for _bit in 0..62
+        if rest > 0
+            count = count + 1
+            rest = rest >>> 1
+    count
 
 // Where a data block's payload starts: past its pointer slots.
 //
@@ -72,7 +83,7 @@ pub fn pointer_count(block_count: Int) -> Int []
 //     println("${nvfsctz.data_offset(256)}")
 // ```
 pub fn data_offset(block_count: Int) -> Int []
-    todo("nvfs-core.nvfsctz.data_offset")
+    4 * pointer_count(block_count)
 
 // How many payload bytes each data block holds.
 //
@@ -87,7 +98,14 @@ pub fn data_offset(block_count: Int) -> Int []
 //     println("${nvfsctz.capacity(512, 256)}")
 // ```
 pub fn capacity(block_size: Int, block_count: Int) -> Int []
-    todo("nvfs-core.nvfsctz.capacity")
+    // A block smaller than its own pointer slots holds no payload,
+    // and zero is the answer that makes the division below refusable
+    // rather than a division by a negative number.
+    let room = block_size - data_offset(block_count)
+    if room < 0
+        0
+    else
+        room
 
 // How many blocks a file of this size occupies.
 //
@@ -101,7 +119,12 @@ pub fn capacity(block_size: Int, block_count: Int) -> Int []
 //     println("${nvfsctz.block_count_for(1000, 480)}")   // 3
 // ```
 pub fn block_count_for(size: Int, capacity_bytes: Int) -> Int []
-    todo("nvfs-core.nvfsctz.block_count_for")
+    // A size of zero or less is no bytes, and a capacity of zero or
+    // less is a geometry that cannot hold any: neither is a division.
+    if size <= 0 or capacity_bytes <= 0
+        0
+    else
+        (size + capacity_bytes - 1) / capacity_bytes
 
 // The chain index holding byte `off`.
 //
@@ -112,7 +135,10 @@ pub fn block_count_for(size: Int, capacity_bytes: Int) -> Int []
 //     println("${nvfsctz.index_of_offset(1000, 480)}")   // 2
 // ```
 pub fn index_of_offset(off: Int, capacity_bytes: Int) -> Int []
-    todo("nvfs-core.nvfsctz.index_of_offset")
+    if off < 0 or capacity_bytes <= 0
+        0
+    else
+        off / capacity_bytes
 
 // Where inside that block byte `off` lands, counting from the block's
 // payload rather than from its first byte.
@@ -124,7 +150,10 @@ pub fn index_of_offset(off: Int, capacity_bytes: Int) -> Int []
 //     println("${nvfsctz.offset_in_block(1000, 480)}")   // 40
 // ```
 pub fn offset_in_block(off: Int, capacity_bytes: Int) -> Int []
-    todo("nvfs-core.nvfsctz.offset_in_block")
+    if off < 0 or capacity_bytes <= 0
+        0
+    else
+        off % capacity_bytes
 
 // The chain index of the file's last block.
 //
@@ -135,7 +164,9 @@ pub fn offset_in_block(off: Int, capacity_bytes: Int) -> Int []
 //     println("${nvfsctz.last_index(1000, 480)}")        // 2
 // ```
 pub fn last_index(size: Int, capacity_bytes: Int) -> Int []
-    todo("nvfs-core.nvfsctz.last_index")
+    // An empty file has no last block, and -1 is one less than the
+    // zero `block_count_for` answers for it.
+    block_count_for(size, capacity_bytes) - 1
 
 // Where skip pointer `j` sits inside a data block.
 //
@@ -146,7 +177,12 @@ pub fn last_index(size: Int, capacity_bytes: Int) -> Int []
 //     println("${nvfsctz.pointer_offset(2)}")            // 8
 // ```
 pub fn pointer_offset(j: Int) -> Int []
-    todo("nvfs-core.nvfsctz.pointer_offset")
+    // A slot number below zero is not a slot, and -1 is the "no jump"
+    // answer `walk_jump` gives rather than a slot to read.
+    if j < 0
+        0
+    else
+        4 * j
 
 // The chain index skip pointer `j` of a block at `index` reaches.
 //
@@ -157,7 +193,15 @@ pub fn pointer_offset(j: Int) -> Int []
 //     println("${nvfsctz.pointer_target(9, 3)}")         // 1
 // ```
 pub fn pointer_target(index: Int, j: Int) -> Int []
-    todo("nvfs-core.nvfsctz.pointer_target")
+    // A jump of -1 moves nowhere, which is what an arrived walk asks
+    // for.  Sixty-two is the largest shift an `Int` holds, so a slot
+    // past it reaches as far as one can.
+    if j < 0
+        index
+    elif j > 62
+        index - (1 << 62)
+    else
+        index - (1 << j)
 
 // The value a pointer slot holds when there is nothing to point at.
 //
@@ -172,7 +216,11 @@ pub fn pointer_target(index: Int, j: Int) -> Int []
 //     println("${nvfsctz.absent_pointer()}")
 // ```
 pub fn absent_pointer() -> Int []
-    todo("nvfs-core.nvfsctz.absent_pointer")
+    // `nvfsgeo.erased_word`, and not a literal, because two spellings
+    // of the same 32-bit word in two files is one place for them to
+    // disagree — and a disagreement here is a live pointer read as an
+    // absent one.
+    nvfsgeo.erased_word()
 
 // A walk from a block at a known chain index towards a target index.
 //
@@ -184,7 +232,7 @@ pub fn absent_pointer() -> Int []
 //     println("${nvfsctz.walk_block(w)}")
 // ```
 pub fn walk(head_block: Int, head_index: Int, target: Int) -> NvfsCtzWalk []
-    todo("nvfs-core.nvfsctz.walk")
+    NvfsCtzWalk { block: head_block, index: head_index, target: target }
 
 // Which skip pointer to read next: the largest jump that does not
 // overshoot the target, or -1 when the walk has arrived.
@@ -200,7 +248,25 @@ pub fn walk(head_block: Int, head_index: Int, target: Int) -> NvfsCtzWalk []
 //     println("${nvfsctz.walk_jump(nvfsctz.walk(41, 9, 1), 9)}")
 // ```
 pub fn walk_jump(w: NvfsCtzWalk, pointers: Int) -> Int []
-    todo("nvfs-core.nvfsctz.walk_jump")
+    if walk_done(w)
+        0 - 1
+    else
+        // The candidates are walked from the longest jump down, and
+        // the first one that lands on or past the target and not
+        // before the chain's first block is the answer.  A device
+        // reads the slot, so this is the loop's shape: one comparison
+        // per slot, no allocation, and a walk that has overshot falls
+        // out with -1 rather than moving backwards.
+        var best = 0 - 1
+        var found = false
+        for k in 0..pointers
+            let j = pointers - 1 - k
+            if not found
+                let landing = pointer_target(w.index, j)
+                if landing >= w.target and landing >= 0
+                    best = j
+                    found = true
+        best
 
 // The walk after following pointer `j` to `next_block`.
 //
@@ -212,7 +278,14 @@ pub fn walk_jump(w: NvfsCtzWalk, pointers: Int) -> Int []
 //     println("${nvfsctz.walk_index(nvfsctz.walk_step(w, 3, 33))}")
 // ```
 pub fn walk_step(w: NvfsCtzWalk, j: Int, next_block: Int) -> NvfsCtzWalk []
-    todo("nvfs-core.nvfsctz.walk_step")
+    // A jump of -1 is the arrived answer, and stepping on it must not
+    // move the walk — the caller hands back whatever `walk_jump` said.
+    if j < 0
+        w
+    else
+        NvfsCtzWalk { block: next_block,
+                      index: pointer_target(w.index, j),
+                      target: w.target }
 
 // Whether the walk has reached its target.
 //
@@ -223,7 +296,10 @@ pub fn walk_step(w: NvfsCtzWalk, j: Int, next_block: Int) -> NvfsCtzWalk []
 //     println("${nvfsctz.walk_done(nvfsctz.walk(41, 9, 9))}")
 // ```
 pub fn walk_done(w: NvfsCtzWalk) -> Bool []
-    todo("nvfs-core.nvfsctz.walk_done")
+    // `<=` rather than `==`: an index below the target is not one a
+    // correct walk produces, so refusing to keep seeking past it is
+    // the safe reading of a corrupt one.
+    w.index <= w.target
 
 // The block the walk is standing on.
 //
@@ -234,7 +310,7 @@ pub fn walk_done(w: NvfsCtzWalk) -> Bool []
 //     println("${nvfsctz.walk_block(nvfsctz.walk(41, 9, 1))}")
 // ```
 pub fn walk_block(w: NvfsCtzWalk) -> Int []
-    todo("nvfs-core.nvfsctz.walk_block")
+    w.block
 
 // The chain index the walk is standing at.
 //
@@ -245,7 +321,7 @@ pub fn walk_block(w: NvfsCtzWalk) -> Int []
 //     println("${nvfsctz.walk_index(nvfsctz.walk(41, 9, 1))}")
 // ```
 pub fn walk_index(w: NvfsCtzWalk) -> Int []
-    todo("nvfs-core.nvfsctz.walk_index")
+    w.index
 
 // How many pointer reads a walk between two indices costs.
 //
@@ -260,7 +336,25 @@ pub fn walk_index(w: NvfsCtzWalk) -> Int []
 //     println("${nvfsctz.seek_reads(9, 1, 9)}")
 // ```
 pub fn seek_reads(from_index: Int, to_index: Int, pointers: Int) -> Int []
-    todo("nvfs-core.nvfsctz.seek_reads")
+    // The same greedy `walk_jump` asks for, one pass per hop: each
+    // pass takes the longest jump that does not overshoot, so the
+    // count is the number of set bits in the distance and no pass
+    // can move the index below zero.  The outer bound is the widest
+    // an index can be, which is also the most hops that can be taken.
+    var at = from_index
+    var steps = 0
+    for _pass in 0..63
+        if at > to_index
+            var took = false
+            for k in 0..pointers
+                let j = pointers - 1 - k
+                if not took
+                    let landing = pointer_target(at, j)
+                    if landing >= to_index and landing >= 0
+                        at = landing
+                        steps = steps + 1
+                        took = true
+    steps
 
 // Whether a block id read out of a pointer slot could be a real one.
 //
@@ -275,7 +369,10 @@ pub fn seek_reads(from_index: Int, to_index: Int, pointers: Int) -> Int []
 //     println("${nvfsctz.pointer_is_plausible(33, 256)}")
 // ```
 pub fn pointer_is_plausible(block: Int, block_count: Int) -> Bool []
-    todo("nvfs-core.nvfsctz.pointer_is_plausible")
+    // Both ends: a negative block id is a read before the device, and
+    // the absent marker is 4294967295, which is past the end of every
+    // device this format can address.
+    block >= 0 and block < block_count
 
 // Whether a file of this size lives inline in its directory entry
 // rather than in a chain.
@@ -291,7 +388,9 @@ pub fn pointer_is_plausible(block: Int, block_count: Int) -> Bool []
 //     println("${nvfsctz.is_inline(64, 128)}")
 // ```
 pub fn is_inline(size: Int, inline_max: Int) -> Bool []
-    todo("nvfs-core.nvfsctz.is_inline")
+    // At or below, so a threshold of zero still stores empty files
+    // without a block.
+    size <= inline_max
 
 // Whether a shrink to `new_size` can reuse the chain it already has.
 //
@@ -309,4 +408,12 @@ pub fn is_inline(size: Int, inline_max: Int) -> Bool []
 // ```
 pub fn shrink_reuses_prefix(size: Int, new_size: Int, capacity_bytes: Int,
                             inline_max: Int) -> Bool []
-    todo("nvfs-core.nvfsctz.shrink_reuses_prefix")
+    // Three ways it does not: an extension is not a shrink, either
+    // end being inline means the entry changes kind rather than
+    // shrinking, and a capacity of zero is a chain whose blocks hold
+    // no bytes — the prefix argument needs the offsets to mean
+    // something.
+    capacity_bytes > 0
+        and new_size < size
+        and not is_inline(new_size, inline_max)
+        and not is_inline(size, inline_max)

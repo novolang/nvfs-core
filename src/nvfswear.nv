@@ -1,8 +1,6 @@
 // nvfswear.nv — wear levelling and power-loss resilience, as rules
 // over block numbers.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS PART OF THE DEVICE CLAIM.  Allocation is a cursor and
 // a comparison, arbitration is two revision words and a `>`, and the
 // relocation threshold is a modulo.  `NvfsAlloc` is three `Int`s in a
@@ -39,6 +37,8 @@
 // across the device, and because the seed only moves where the scan
 // STARTS, a wrong seed costs a longer scan and never a wrong answer.
 
+use nvfsgeo
+
 // A rotating allocation cursor, mid-scan.
 //
 // Three integers: where to look next, how far the scan has come, and
@@ -66,7 +66,7 @@ struct NvfsAlloc
 //     println("${nvfswear.first_allocatable()}")
 // ```
 pub fn first_allocatable() -> Int []
-    todo("nvfs-core.nvfswear.first_allocatable")
+    2
 
 // Where the cursor should start, given the revision a mount found.
 //
@@ -80,7 +80,16 @@ pub fn first_allocatable() -> Int []
 //     println("${nvfswear.cursor_seed(7, 256)}")
 // ```
 pub fn cursor_seed(revision: Int, block_count: Int) -> Int []
-    todo("nvfs-core.nvfswear.cursor_seed")
+    // The revision modulo the allocatable range, lifted to the first
+    // allocatable block.  A revision below zero is not one, and a
+    // device with nothing allocatable is a geometry the caller should
+    // have refused, so both answer the first block rather than a
+    // division or a modulo by zero.
+    let span = block_count - first_allocatable()
+    if revision < 0 or span <= 0
+        first_allocatable()
+    else
+        first_allocatable() + revision % span
 
 // A fresh allocation scan starting at a cursor.
 //
@@ -91,7 +100,21 @@ pub fn cursor_seed(revision: Int, block_count: Int) -> Int []
 //     println("${nvfswear.alloc_candidate(nvfswear.alloc(2), 256)}")
 // ```
 pub fn alloc(cursor: Int) -> NvfsAlloc []
-    todo("nvfs-core.nvfswear.alloc")
+    NvfsAlloc { cursor: cursor, scanned: 0, taken: 0 }
+
+// A cursor lifted to the first allocatable block: a cursor below it
+// is not a block a caller may be handed, and `alloc_candidate` is the
+// one place that has to say so.
+//
+// Private because it is half of one expression: `alloc_candidate` is
+// all of its callers, and a second spelling of the floor would be a
+// second place to get the floor wrong.
+
+fn lift_cursor(cursor: Int) -> Int []
+    if cursor < first_allocatable()
+        first_allocatable()
+    else
+        cursor
 
 // The block this scan is looking at, normalised into range.
 //
@@ -102,7 +125,19 @@ pub fn alloc(cursor: Int) -> NvfsAlloc []
 //     println("${nvfswear.alloc_candidate(nvfswear.alloc(300), 256)}")
 // ```
 pub fn alloc_candidate(a: NvfsAlloc, block_count: Int) -> Int []
-    todo("nvfs-core.nvfswear.alloc_candidate")
+    // The cursor is remembered across allocations and mounts, so it
+    // is attacker-controlled in the only sense that matters here: it
+    // can be any `Int` at all.  Normalising it is the same modulo
+    // `cursor_seed` uses, over the allocatable range, so a cursor
+    // past the end wraps and a cursor below the first allocatable
+    // block is lifted to it.  A device with no allocatable block has
+    // no candidate, and the first allocatable one is the answer a
+    // caller can recognise rather than a divide by zero.
+    let span = block_count - first_allocatable()
+    if span <= 0
+        first_allocatable()
+    else
+        (lift_cursor(a.cursor) - first_allocatable()) % span + first_allocatable()
 
 // The scan after taking the block it was looking at.
 //
@@ -113,7 +148,9 @@ pub fn alloc_candidate(a: NvfsAlloc, block_count: Int) -> Int []
 //     println("${nvfswear.alloc_taken(nvfswear.alloc_take(nvfswear.alloc(2), 256))}")
 // ```
 pub fn alloc_take(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
-    todo("nvfs-core.nvfswear.alloc_take")
+    NvfsAlloc { cursor: alloc_candidate(a, block_count) + 1,
+                scanned: a.scanned + 1,
+                taken: a.taken + 1 }
 
 // The scan after rejecting the block it was looking at — because it is
 // reachable from the root, or because it has been retired.
@@ -125,7 +162,11 @@ pub fn alloc_take(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
 //     println("${nvfswear.alloc_candidate(nvfswear.alloc_skip(nvfswear.alloc(2), 256), 256)}")
 // ```
 pub fn alloc_skip(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
-    todo("nvfs-core.nvfswear.alloc_skip")
+    // The same move on as a take, without counting the block: a
+    // rejected candidate is not one this allocation got.
+    NvfsAlloc { cursor: alloc_candidate(a, block_count) + 1,
+                scanned: a.scanned + 1,
+                taken: a.taken }
 
 // How many blocks this scan has taken.
 //
@@ -136,7 +177,7 @@ pub fn alloc_skip(a: NvfsAlloc, block_count: Int) -> NvfsAlloc []
 //     println("${nvfswear.alloc_taken(nvfswear.alloc(2))}")
 // ```
 pub fn alloc_taken(a: NvfsAlloc) -> Int []
-    todo("nvfs-core.nvfswear.alloc_taken")
+    a.taken
 
 // Whether the scan has been all the way round without finding enough.
 //
@@ -151,7 +192,8 @@ pub fn alloc_taken(a: NvfsAlloc) -> Int []
 //     println("${nvfswear.alloc_exhausted(nvfswear.alloc(2), 256)}")
 // ```
 pub fn alloc_exhausted(a: NvfsAlloc, block_count: Int) -> Bool []
-    todo("nvfs-core.nvfswear.alloc_exhausted")
+    // Every allocatable block considered once is the whole device.
+    a.scanned >= block_count - first_allocatable()
 
 // The cursor to remember for the next allocation.
 //
@@ -162,7 +204,7 @@ pub fn alloc_exhausted(a: NvfsAlloc, block_count: Int) -> Bool []
 //     println("${nvfswear.alloc_cursor(nvfswear.alloc(2))}")
 // ```
 pub fn alloc_cursor(a: NvfsAlloc) -> Int []
-    todo("nvfs-core.nvfswear.alloc_cursor")
+    a.cursor
 
 // Which of a pair's two blocks wins: 0, 1, or -1 when neither is
 // valid.
@@ -180,7 +222,19 @@ pub fn alloc_cursor(a: NvfsAlloc) -> Int []
 // ```
 pub fn winner(revision_first: Int, valid_first: Bool, revision_second: Int,
               valid_second: Bool) -> Int []
-    todo("nvfs-core.nvfswear.winner")
+    if not valid_first and not valid_second
+        0 - 1
+    elif not valid_first
+        1
+    elif not valid_second
+        0
+    elif revision_second > revision_first
+        1
+    else
+        // The first wins a tie, and a tie is what a fresh format
+        // leaves: one block sealed at one revision and its sibling
+        // erased.
+        0
 
 // Whether a revision word has been programmed — that is, whether the
 // block it heads is complete.
@@ -195,7 +249,7 @@ pub fn winner(revision_first: Int, valid_first: Bool, revision_second: Int,
 //     println("${nvfswear.revision_is_sealed(1)}")
 // ```
 pub fn revision_is_sealed(word: Int) -> Bool []
-    todo("nvfs-core.nvfswear.revision_is_sealed")
+    word != nvfsgeo.erased_word()
 
 // The revision a compaction into the sibling should carry.
 //
@@ -206,7 +260,10 @@ pub fn revision_is_sealed(word: Int) -> Bool []
 //     println("${nvfswear.next_revision(7)}")
 // ```
 pub fn next_revision(revision: Int) -> Int []
-    todo("nvfs-core.nvfswear.next_revision")
+    // One more, always: the revision is a counter, and the wrap at
+    // 2^32 is the documented deferral rather than something this
+    // function papers over.
+    revision + 1
 
 // Whether a revision is close enough to wrapping that a driver should
 // say so.
@@ -222,7 +279,10 @@ pub fn next_revision(revision: Int) -> Int []
 //     println("${nvfswear.revision_near_wrap(7)}")
 // ```
 pub fn revision_near_wrap(revision: Int) -> Bool []
-    todo("nvfs-core.nvfswear.revision_near_wrap")
+    // Within a million compactions of the erased word, and a sealed
+    // revision: the erased word is not a revision at all, so a block
+    // that has never been sealed is not "about to wrap".
+    revision_is_sealed(revision) and revision >= 4294967295 - 1000000
 
 // Where a compaction programs the revision word.
 //
@@ -237,7 +297,7 @@ pub fn revision_near_wrap(revision: Int) -> Bool []
 //     println("${nvfswear.seal_offset()}")
 // ```
 pub fn seal_offset() -> Int []
-    todo("nvfs-core.nvfswear.seal_offset")
+    0
 
 // How many bytes the seal program writes: one prog page, padded.
 //
@@ -251,7 +311,10 @@ pub fn seal_offset() -> Int []
 //     println("${nvfswear.seal_span(256)}")
 // ```
 pub fn seal_span(prog_size: Int) -> Int []
-    todo("nvfs-core.nvfswear.seal_span")
+    // The revision word is four bytes, so a prog page smaller than
+    // that still writes four: the same `max(4, prog_size)` that puts
+    // the records past the seal in the first place.
+    nvfsgeo.align_up(4, prog_size)
 
 // Whether one more record may be APPENDED to a log, rather than
 // forcing a compaction.
@@ -268,7 +331,13 @@ pub fn seal_span(prog_size: Int) -> Int []
 //     println("${nvfswear.append_allowed(true, 512, 48, 4096)}")   // false
 // ```
 pub fn append_allowed(torn: Bool, end_offset: Int, span: Int, block_size: Int) -> Bool []
-    todo("nvfs-core.nvfswear.append_allowed")
+    // `<=` here, and `nvfsgeo.append_fits` is strict: this is the
+    // final grant for a span the caller has already chosen and
+    // padded, and a record that exactly reaches the block's end is
+    // one this block can hold.  The predicate that decides BETWEEN
+    // an append and a compaction is `append_fits`, which reserves
+    // the block's tail.
+    not torn and end_offset + span <= block_size
 
 // Whether a metadata pair has compacted often enough to be moved to
 // fresh blocks.
@@ -285,7 +354,12 @@ pub fn append_allowed(torn: Bool, end_offset: Int, span: Int, block_size: Int) -
 //     println("${nvfswear.should_relocate(100, 100)}")
 // ```
 pub fn should_relocate(revision: Int, block_cycles: Int) -> Bool []
-    todo("nvfs-core.nvfswear.should_relocate")
+    if revision == 0 or relocation_disabled(block_cycles)
+        false
+    else
+        // A revision of zero has never been compacted, so it is not
+        // an erase count yet whatever the modulo says.
+        revision % block_cycles == 0
 
 // Whether relocation is switched off for this volume.
 //
@@ -300,7 +374,9 @@ pub fn should_relocate(revision: Int, block_cycles: Int) -> Bool []
 //     println("${nvfswear.relocation_disabled(0 - 1)}")
 // ```
 pub fn relocation_disabled(block_cycles: Int) -> Bool []
-    todo("nvfs-core.nvfswear.relocation_disabled")
+    // Anything below zero is "off", and `block_cycles_valid` keeps
+    // the rest out.
+    block_cycles < 0
 
 // `block_cycles` as the superblock stores it.
 //
@@ -316,7 +392,10 @@ pub fn relocation_disabled(block_cycles: Int) -> Bool []
 //     println("${nvfswear.encode_block_cycles(0 - 1)}")   // 0
 // ```
 pub fn encode_block_cycles(block_cycles: Int) -> Int []
-    todo("nvfs-core.nvfswear.encode_block_cycles")
+    if block_cycles < 0
+        0
+    else
+        block_cycles
 
 // `block_cycles` as read back out of the superblock.
 //
@@ -327,7 +406,14 @@ pub fn encode_block_cycles(block_cycles: Int) -> Int []
 //     println("${nvfswear.decode_block_cycles(0)}")       // -1
 // ```
 pub fn decode_block_cycles(stored: Int) -> Int []
-    todo("nvfs-core.nvfswear.decode_block_cycles")
+    // A u32 field read back as zero, or as a negative if a caller
+    // handed in something that never came off a device, is the "never
+    // relocate" setting rather than a threshold of zero that would
+    // relocate on every commit.
+    if stored <= 0
+        0 - 1
+    else
+        stored
 
 // Whether a `block_cycles` setting is one a volume may be formatted
 // with.
@@ -342,7 +428,9 @@ pub fn decode_block_cycles(stored: Int) -> Int []
 //     println("${nvfswear.block_cycles_valid(0)}")        // false
 // ```
 pub fn block_cycles_valid(block_cycles: Int) -> Bool []
-    todo("nvfs-core.nvfswear.block_cycles_valid")
+    // -1 is "never", a positive number is a threshold, and zero and
+    // everything below -1 are not settings.
+    block_cycles >= 0 - 1 and block_cycles != 0
 
 // Whether a block that failed an erase or a program should be retired
 // for the rest of this session.
@@ -360,7 +448,7 @@ pub fn block_cycles_valid(block_cycles: Int) -> Bool []
 //     println("${nvfswear.should_retire(false)}")
 // ```
 pub fn should_retire(operation_succeeded: Bool) -> Bool []
-    todo("nvfs-core.nvfswear.should_retire")
+    not operation_succeeded
 
 // How many times an allocation retries on fresh blocks before giving
 // up.
@@ -377,4 +465,4 @@ pub fn should_retire(operation_succeeded: Bool) -> Bool []
 //     println("${nvfswear.allocation_attempts()}")
 // ```
 pub fn allocation_attempts() -> Int []
-    todo("nvfs-core.nvfswear.allocation_attempts")
+    3

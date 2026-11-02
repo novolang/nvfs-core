@@ -1,8 +1,6 @@
 // nvfsmeta.nv — a metadata pair: the append-only record log, its
 // arbitration, and the commit-and-seal cycle.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // NOT IN THE DEVICE CLAIM.  A record holds `Bytes` and a scan answers a
 // list of them, so this module allocates by construction.  The
 // arithmetic it decides with is `nvfsgeo`'s and IS in the claim; a
@@ -43,6 +41,7 @@
 
 use crc
 use nvfsgeo
+use nvfswear
 
 // One record: a type byte and a payload.
 //
@@ -95,8 +94,9 @@ pub struct NvfsPairState
 //     let r = nvfsmeta.record(2, bytes.from_byte_list([1, 2]))
 //     println("${nvfsmeta.record_type(r)}")
 // ```
-pub fn record(rtype: Int, payload: Bytes) -> NvfsRecord []
-    todo("nvfs-core.nvfsmeta.record")
+pub @tier(app)
+fn record(rtype: Int, payload: Bytes) -> NvfsRecord []
+    NvfsRecord { rtype: rtype, payload: payload }
 
 // A record's type byte.
 //
@@ -107,8 +107,9 @@ pub fn record(rtype: Int, payload: Bytes) -> NvfsRecord []
 // fn main() [io]
 //     println("${nvfsmeta.record_type(nvfsmeta.record(2, bytes.from_byte_list([])))}")
 // ```
-pub fn record_type(r: NvfsRecord) -> Int []
-    todo("nvfs-core.nvfsmeta.record_type")
+pub @tier(app)
+fn record_type(r: NvfsRecord) -> Int []
+    r.rtype
 
 // A record's payload.
 //
@@ -119,8 +120,11 @@ pub fn record_type(r: NvfsRecord) -> Int []
 // fn main() [io]
 //     println("${bytes.len(nvfsmeta.record_payload(nvfsmeta.record(2, bytes.from_byte_list([1]))))}")
 // ```
-pub fn record_payload(r: NvfsRecord) -> Bytes []
-    todo("nvfs-core.nvfsmeta.record_payload")
+pub @tier(app)
+fn record_payload(r: NvfsRecord) -> Bytes []
+    // A copy: the interface answers a buffer the caller may write,
+    // and the record's own payload is not the caller's to write.
+    bytes.clone(r.payload)
 
 // The bytes a record occupies on disk: header, payload, CRC.
 //
@@ -131,8 +135,22 @@ pub fn record_payload(r: NvfsRecord) -> Bytes []
 // fn main() [io]
 //     println("${bytes.len(nvfsmeta.encode_record(nvfsmeta.record(2, bytes.from_byte_list([1]))))}")
 // ```
-pub fn encode_record(r: NvfsRecord) -> Bytes []
-    todo("nvfs-core.nvfsmeta.encode_record")
+pub @tier(app)
+fn encode_record(r: NvfsRecord) -> Bytes []
+    // [ type u8 | flags u8 | len u16 | payload | crc32c u32 ], all
+    // little-endian, and the CRC covers the header AND the payload and
+    // NOT its own four bytes — a checksum that covered itself could
+    // never be checked, because the bytes it would check do not exist
+    // until it has been computed.
+    //
+    // The flags byte is reserved and written as zero.  It is written
+    // by this function and read by `scan_block` through the same
+    // layout, so it is where a future flag goes rather than spare
+    // room to spend.
+    let header = bytes.u8(r.rtype) + bytes.u8(0) + bytes.u16_le(bytes.len(r.payload))
+    let body = header + r.payload
+    let sum = record_crc(body)
+    body + bytes.u32_le(sum)
 
 // The CRC-32C of a record's header and payload, which is what the
 // four bytes after them hold.
@@ -148,8 +166,13 @@ pub fn encode_record(r: NvfsRecord) -> Bytes []
 // fn main() [io]
 //     println("${nvfsmeta.record_crc(bytes.from_str("123456789"))}")
 // ```
-pub fn record_crc(header_and_payload: Bytes) -> Int []
-    todo("nvfs-core.nvfsmeta.record_crc")
+pub @tier(app)
+fn record_crc(header_and_payload: Bytes) -> Int []
+    // `crc-nv`'s published check value says this is CRC-32C: the nine
+    // bytes `123456789` answer 0xE3069283, and the suite asserts it.
+    // The table is built per call, which a caller checksumming a
+    // stream should not pay — `checksum` is the one to hold.
+    crc.crc32c().checksum(header_and_payload)
 
 // The CRC-32C algorithm this format uses.
 //
@@ -162,8 +185,9 @@ pub fn record_crc(header_and_payload: Bytes) -> Int []
 // fn main() [io]
 //     println("${nvfsmeta.checksum().width}")
 // ```
-pub fn checksum() -> crc.Crc []
-    todo("nvfs-core.nvfsmeta.checksum")
+pub @tier(app)
+fn checksum() -> crc.Crc []
+    crc.crc32c()
 
 // Decode a whole metadata block from the bytes the host read.
 //
@@ -182,8 +206,72 @@ pub fn checksum() -> crc.Crc []
 //     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
 //     println("${nvfsmeta.scan_valid(s)}")
 // ```
-pub fn scan_block(prog_size: Int, block_size: Int, image: Bytes) -> NvfsScan []
-    todo("nvfs-core.nvfsmeta.scan_block")
+pub @tier(app)
+fn scan_block(prog_size: Int, block_size: Int, image: Bytes) -> NvfsScan []
+    // A block is untrusted input: every offset this walks to has been
+    // checked against the image and the block before it is used, and
+    // nothing is sliced out of a header whose length field says it
+    // reaches past the end.
+    let algo = crc.crc32c()
+    let word = bytes.u32_le_at(image, 0) ?? nvfsgeo.erased_word()
+    let valid = nvfswear.revision_is_sealed(word)
+    // A host that answered a short read hands in a short image, and
+    // the walk may not step past the bytes it actually got.
+    var limit = block_size
+    if bytes.len(image) < limit
+        limit = bytes.len(image)
+    var records: [NvfsRecord] = []
+    var torn = false
+    var off = nvfsgeo.meta_offset(prog_size)
+    var end = off
+    var running = true
+    while running and off < limit
+        let rtype = bytes.byte_at(image, off) ?? nvfsgeo.erased_byte()
+        if rtype == nvfsgeo.reserved_record_type()
+            // Free space: the log ended here, and an append starts
+            // here.  The padding BETWEEN records is never read — the
+            // walk reaches the next record by `align_up`, which is how
+            // the erased runs an append leaves are stepped over rather
+            // than mistaken for the end.
+            running = false
+        else
+            let len = bytes.u16_le_at(image, off + 2) ?? 0
+            let body_end = off + 4 + len
+            if body_end + 4 > limit
+                // The length field says the record reaches past what
+                // the host read.  Nothing is sliced; the log ends here
+                // and the block is full.
+                torn = true
+                end = block_size
+                running = false
+            else
+                let body = bytes.slice(image, off, body_end)
+                let stored = bytes.u32_le_at(image, body_end) ?? 0
+                if algo.checksum(body) != stored
+                    // One bit anywhere in the header or the payload —
+                    // or in the CRC field itself — lands here.  Rule 2:
+                    // the log ends and the block is FULL, because NOR
+                    // programming only clears bits and this tail cannot
+                    // be rewritten.
+                    torn = true
+                    end = block_size
+                    running = false
+                else
+                    records = list.push(records, record(rtype, bytes.slice(image, off + 4, body_end)))
+                    end = nvfsgeo.align_up(body_end + 4, prog_size)
+                    off = end
+    // An unsealed block still reports the records it holds — a
+    // compaction interrupted between its last record and its seal
+    // leaves exactly that — and `valid` is what keeps it out of
+    // arbitration.
+    var revision = 0
+    if valid
+        revision = word
+    NvfsScan { valid: valid,
+               revision: revision,
+               records: records,
+               torn: torn,
+               end_offset: end }
 
 // Whether a scanned block takes part in arbitration.
 //
@@ -194,8 +282,9 @@ pub fn scan_block(prog_size: Int, block_size: Int, image: Bytes) -> NvfsScan []
 // fn main() [io]
 //     println("${nvfsmeta.scan_valid(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
 // ```
-pub fn scan_valid(s: NvfsScan) -> Bool []
-    todo("nvfs-core.nvfsmeta.scan_valid")
+pub @tier(app)
+fn scan_valid(s: NvfsScan) -> Bool []
+    s.valid
 
 // A scanned block's revision.
 //
@@ -206,8 +295,9 @@ pub fn scan_valid(s: NvfsScan) -> Bool []
 // fn main() [io]
 //     println("${nvfsmeta.scan_revision(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
 // ```
-pub fn scan_revision(s: NvfsScan) -> Int []
-    todo("nvfs-core.nvfsmeta.scan_revision")
+pub @tier(app)
+fn scan_revision(s: NvfsScan) -> Int []
+    s.revision
 
 // A scanned block's records, in log order.
 //
@@ -219,8 +309,11 @@ pub fn scan_revision(s: NvfsScan) -> Int []
 // fn main() [io]
 //     println("${list.len(nvfsmeta.scan_records(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))))}")
 // ```
-pub fn scan_records(s: NvfsScan) -> [NvfsRecord] []
-    todo("nvfs-core.nvfsmeta.scan_records")
+pub @tier(app)
+fn scan_records(s: NvfsScan) -> [NvfsRecord] []
+    // A copy of the list, for the same reason: a caller that pushed
+    // into what this answered would be editing the scan.
+    s.records[:]
 
 // Whether a scanned block's log ended in garbage.
 //
@@ -231,8 +324,9 @@ pub fn scan_records(s: NvfsScan) -> [NvfsRecord] []
 // fn main() [io]
 //     println("${nvfsmeta.scan_torn(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
 // ```
-pub fn scan_torn(s: NvfsScan) -> Bool []
-    todo("nvfs-core.nvfsmeta.scan_torn")
+pub @tier(app)
+fn scan_torn(s: NvfsScan) -> Bool []
+    s.torn
 
 // The first byte an append to this block may start at.
 //
@@ -243,8 +337,9 @@ pub fn scan_torn(s: NvfsScan) -> Bool []
 // fn main() [io]
 //     println("${nvfsmeta.scan_end(nvfsmeta.scan_block(256, 4096, bytes.zeros(4096)))}")
 // ```
-pub fn scan_end(s: NvfsScan) -> Int []
-    todo("nvfs-core.nvfsmeta.scan_end")
+pub @tier(app)
+fn scan_end(s: NvfsScan) -> Int []
+    s.end_offset
 
 // A pair, by its two block numbers.
 //
@@ -254,8 +349,9 @@ pub fn scan_end(s: NvfsScan) -> Int []
 // fn main() [io]
 //     println("${nvfsmeta.pair(0, 1).first}")
 // ```
-pub fn pair(first: Int, second: Int) -> NvfsPair []
-    todo("nvfs-core.nvfsmeta.pair")
+pub @tier(app)
+fn pair(first: Int, second: Int) -> NvfsPair []
+    NvfsPair { first: first, second: second }
 
 // Which block of a pair is active, given both scans.
 //
@@ -270,8 +366,19 @@ pub fn pair(first: Int, second: Int) -> NvfsPair []
 //     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
 //     println("${nvfsmeta.arbitrate(nvfsmeta.pair(0, 1), s, s).ok}")
 // ```
-pub fn arbitrate(p: NvfsPair, first: NvfsScan, second: NvfsScan) -> NvfsPairState []
-    todo("nvfs-core.nvfsmeta.arbitrate")
+pub @tier(app)
+fn arbitrate(p: NvfsPair, first: NvfsScan, second: NvfsScan) -> NvfsPairState []
+    let w = nvfswear.winner(first.revision, first.valid, second.revision, second.valid)
+    if w == 1
+        NvfsPairState { ok: true, active: p.second, sibling: p.first, scan: second }
+    elif w == 0
+        NvfsPairState { ok: true, active: p.first, sibling: p.second, scan: first }
+    else
+        // Neither takes part.  A fresh device and wreckage both land
+        // here, and `pair_is_blank` is what tells them apart; the
+        // first block is named as the pair's own so a caller that
+        // asks anyway answers a block of the pair rather than zero.
+        NvfsPairState { ok: false, active: p.first, sibling: p.second, scan: first }
 
 // Whether neither block held anything at all — a fresh device rather
 // than a damaged volume.
@@ -289,8 +396,15 @@ pub fn arbitrate(p: NvfsPair, first: NvfsScan, second: NvfsScan) -> NvfsPairStat
 //     let s = nvfsmeta.scan_block(256, 4096, bytes.zeros(4096))
 //     println("${nvfsmeta.pair_is_blank(s, s)}")
 // ```
-pub fn pair_is_blank(first: NvfsScan, second: NvfsScan) -> Bool []
-    todo("nvfs-core.nvfsmeta.pair_is_blank")
+pub @tier(app)
+fn pair_is_blank(first: NvfsScan, second: NvfsScan) -> Bool []
+    // Not-valid is not enough on its own: a block can be unsealed
+    // BECAUSE a compaction was cut in the middle of it, and that is
+    // damage rather than a blank part.
+    not first.valid
+        and not second.valid
+        and not first.torn
+        and not second.torn
 
 // The image an append programs: the record, padded to a prog page with
 // the erased byte.
@@ -307,8 +421,10 @@ pub fn pair_is_blank(first: NvfsScan, second: NvfsScan) -> Bool []
 //     let r = nvfsmeta.record(2, bytes.from_byte_list([1]))
 //     println("${bytes.len(nvfsmeta.append_image(r, 16))}")
 // ```
-pub fn append_image(r: NvfsRecord, prog_size: Int) -> Bytes []
-    todo("nvfs-core.nvfsmeta.append_image")
+pub @tier(app)
+fn append_image(r: NvfsRecord, prog_size: Int) -> Bytes []
+    let encoded = encode_record(r)
+    pad_to(encoded, prog_size)
 
 // The image a compaction programs: every record, each padded to a prog
 // page, with NO revision word.
@@ -325,8 +441,16 @@ pub fn append_image(r: NvfsRecord, prog_size: Int) -> Bytes []
 // fn main() [io]
 //     println("${bytes.len(nvfsmeta.compaction_image([], 16))}")
 // ```
-pub fn compaction_image(records: [NvfsRecord], prog_size: Int) -> Bytes []
-    todo("nvfs-core.nvfsmeta.compaction_image")
+pub @tier(app)
+fn compaction_image(records: [NvfsRecord], prog_size: Int) -> Bytes []
+    // One image rather than one call per record, so the driver
+    // programs the whole compaction as a single operation and the
+    // seal that follows it is the only thing left to cut.
+    var out = bytes.zeros(0)
+    for r in records
+        let encoded = encode_record(r)
+        out = out + pad_to(encoded, prog_size)
+    out
 
 // The image the seal programs: the revision word, padded to a prog
 // page.
@@ -338,8 +462,10 @@ pub fn compaction_image(records: [NvfsRecord], prog_size: Int) -> Bytes []
 // fn main() [io]
 //     println("${bytes.len(nvfsmeta.seal_image(1, 16))}")
 // ```
-pub fn seal_image(revision: Int, prog_size: Int) -> Bytes []
-    todo("nvfs-core.nvfsmeta.seal_image")
+pub @tier(app)
+fn seal_image(revision: Int, prog_size: Int) -> Bytes []
+    let word = bytes.u32_le(revision)
+    pad_to(word, prog_size)
 
 // How many bytes a record set occupies as a compaction lays it out.
 //
@@ -353,8 +479,15 @@ pub fn seal_image(revision: Int, prog_size: Int) -> Bytes []
 // fn main() [io]
 //     println("${nvfsmeta.records_span([], 16)}")
 // ```
-pub fn records_span(records: [NvfsRecord], prog_size: Int) -> Int []
-    todo("nvfs-core.nvfsmeta.records_span")
+pub @tier(app)
+fn records_span(records: [NvfsRecord], prog_size: Int) -> Int []
+    // Summed through `nvfsgeo.record_span`, which is the same
+    // arithmetic `pad_to` performs on the image: one spelling of the
+    // padding, so a span and an image of that span cannot disagree.
+    var span = 0
+    for r in records
+        span = span + nvfsgeo.record_span(bytes.len(r.payload), prog_size)
+    span
 
 // Whether a record set fits one block after compaction.
 //
@@ -364,8 +497,12 @@ pub fn records_span(records: [NvfsRecord], prog_size: Int) -> Int []
 // fn main() [io]
 //     println("${nvfsmeta.compaction_fits([], 16, 4096)}")
 // ```
-pub fn compaction_fits(records: [NvfsRecord], prog_size: Int, block_size: Int) -> Bool []
-    todo("nvfs-core.nvfsmeta.compaction_fits")
+pub @tier(app)
+fn compaction_fits(records: [NvfsRecord], prog_size: Int, block_size: Int) -> Bool []
+    // The records do not start at zero: the revision word's own page
+    // is in front of them, and a compaction that forgot that would
+    // erase the sibling and then fail to fit.
+    nvfsgeo.meta_offset(prog_size) + records_span(records, prog_size) <= block_size
 
 // Pad an image out to a prog-page multiple with the erased byte.
 //
@@ -376,5 +513,17 @@ pub fn compaction_fits(records: [NvfsRecord], prog_size: Int, block_size: Int) -
 // fn main() [io]
 //     println("${bytes.len(nvfsmeta.pad_to(bytes.zeros(3), 16))}")
 // ```
-pub fn pad_to(image: Bytes, prog_size: Int) -> Bytes []
-    todo("nvfs-core.nvfsmeta.pad_to")
+pub @tier(app)
+fn pad_to(image: Bytes, prog_size: Int) -> Bytes []
+    // The erased byte, because the padding IS free space to the next
+    // scan — a zero here would read as a record with type zero.
+    let n = bytes.len(image)
+    let target = nvfsgeo.align_up(n, prog_size)
+    let pad = target - n
+    if pad <= 0
+        // Already a whole number of pages: the interface answers a
+        // buffer the caller may write, so it answers a copy rather
+        // than the one it was handed.
+        bytes.clone(image)
+    else
+        image + bytes.fill(bytes.zeros(pad), 0, pad, nvfsgeo.erased_byte())

@@ -1,9 +1,6 @@
 // nvfswear_tests.nv — arbitration, allocation, and the three
 // power-loss rules as assertions.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: nvfs-core.nvfswear.<fn>`.
-//
 // THESE ARE THE RULES A READING CANNOT CHECK.  "The revision word is
 // sealed last" and "a torn block is full" are two sentences in
 // `orbit/novofs`'s README, and a rewrite that broke either would still
@@ -37,7 +34,7 @@ fn test_an_erased_revision_word_is_not_a_revision() [io]
     // Rule 1 read backwards: a compaction interrupted before its seal
     // leaves exactly this, and the old block keeps winning.
     test.case("the erased word is not sealed")
-    test.assert(nvfswear.revision_is_sealed(4294967295) == false)
+    test.assert(not nvfswear.revision_is_sealed(4294967295))
 
     test.case("a programmed one is")
     test.assert(nvfswear.revision_is_sealed(1))
@@ -65,10 +62,10 @@ fn test_a_torn_block_is_full_whatever_space_it_appears_to_have() [io]
     test.assert(nvfswear.append_allowed(false, 512, 48, 4096))
 
     test.case("a torn one refuses it, even with the same room")
-    test.assert(nvfswear.append_allowed(true, 512, 48, 4096) == false)
+    test.assert(not nvfswear.append_allowed(true, 512, 48, 4096))
 
     test.case("and a clean block with no room refuses it too")
-    test.assert(nvfswear.append_allowed(false, 4080, 48, 4096) == false)
+    test.assert(not nvfswear.append_allowed(false, 4080, 48, 4096))
 
     test.case("a record that exactly fills the block is allowed")
     test.assert(nvfswear.append_allowed(false, 4048, 48, 4096))
@@ -79,7 +76,7 @@ fn test_allocation_is_a_bounded_scan_that_answers_no_space_rather_than_looping()
     let a = nvfswear.alloc(2)
     test.assert(nvfswear.alloc_candidate(a, 256) == 2)
     test.assert(nvfswear.alloc_taken(a) == 0)
-    test.assert(nvfswear.alloc_exhausted(a, 256) == false)
+    test.assert(not nvfswear.alloc_exhausted(a, 256))
 
     test.case("a cursor past the end wraps into range")
     test.assert(nvfswear.alloc_candidate(nvfswear.alloc(300), 256) >= 2)
@@ -125,17 +122,17 @@ fn test_relocation_is_a_modulo_over_the_revision() [io]
     test.assert(nvfswear.should_relocate(100, 100))
 
     test.case("one that has not, does not")
-    test.assert(nvfswear.should_relocate(99, 100) == false)
+    test.assert(not nvfswear.should_relocate(99, 100))
 
     test.case("and it moves again at twice the threshold")
     test.assert(nvfswear.should_relocate(200, 100))
 
     test.case("a disabled threshold never moves anything")
     test.assert(nvfswear.relocation_disabled(0 - 1))
-    test.assert(nvfswear.should_relocate(100, 0 - 1) == false)
+    test.assert(not nvfswear.should_relocate(100, 0 - 1))
 
     test.case("a revision of zero is not a relocation, whatever the modulo says")
-    test.assert(nvfswear.should_relocate(0, 100) == false)
+    test.assert(not nvfswear.should_relocate(0, 100))
 
 @test
 fn test_minus_one_stores_as_zero_because_the_field_is_a_u32() [io]
@@ -149,12 +146,12 @@ fn test_minus_one_stores_as_zero_because_the_field_is_a_u32() [io]
     test.assert(nvfswear.decode_block_cycles(nvfswear.encode_block_cycles(0 - 1)) == 0 - 1)
 
     test.case("zero is refused as a SETTING — it would relocate on every commit")
-    test.assert(nvfswear.block_cycles_valid(0) == false)
+    test.assert(not nvfswear.block_cycles_valid(0))
     test.assert(nvfswear.block_cycles_valid(100))
     test.assert(nvfswear.block_cycles_valid(0 - 1))
 
     test.case("and nothing below -1 is a setting either")
-    test.assert(nvfswear.block_cycles_valid(0 - 2) == false)
+    test.assert(not nvfswear.block_cycles_valid(0 - 2))
 
 @test
 fn test_a_failed_operation_retires_its_block_and_the_allocation_retries() [io]
@@ -162,7 +159,7 @@ fn test_a_failed_operation_retires_its_block_and_the_allocation_retries() [io]
     test.assert(nvfswear.should_retire(false))
 
     test.case("a success does not")
-    test.assert(nvfswear.should_retire(true) == false)
+    test.assert(not nvfswear.should_retire(true))
 
     test.case("and the retry budget is published so a driver's own agrees with it")
     test.assert(nvfswear.allocation_attempts() == 3)
@@ -172,7 +169,28 @@ fn test_the_revision_wrap_is_a_deferral_a_caller_can_detect() [io]
     // A documented deferral nobody can detect is one nobody will
     // notice, and this format's revision is a u32.
     test.case("an ordinary revision is nowhere near it")
-    test.assert(nvfswear.revision_near_wrap(7) == false)
+    test.assert(not nvfswear.revision_near_wrap(7))
 
     test.case("one close to the erased word is")
     test.assert(nvfswear.revision_near_wrap(4294967294))
+
+@test
+fn test_a_cursor_that_cannot_be_a_block_is_answered_with_one_that_can() [io]
+    // The cursor is remembered across allocations and mounts, so it is
+    // an `Int` a caller may have got from anywhere — including a device
+    // whose geometry says there is nothing to allocate.  Neither case
+    // may be a modulo or a division by zero.
+    test.case("a revision below zero is not a revision")
+    test.assert(nvfswear.cursor_seed(0 - 1, 256) == nvfswear.first_allocatable())
+    test.assert(nvfswear.cursor_seed(0 - 1, 256) == nvfswear.cursor_seed(0, 256))
+
+    test.case("and a device with nothing allocatable seeds the first block rather than dividing")
+    test.assert(nvfswear.cursor_seed(7, 0) == nvfswear.first_allocatable())
+    test.assert(nvfswear.cursor_seed(7, nvfswear.first_allocatable()) == nvfswear.first_allocatable())
+
+    test.case("a scan over such a device has no candidate, and says so with the first block")
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(7), 0) == nvfswear.first_allocatable())
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(7), 0) < nvfswear.first_allocatable() + 1)
+
+    test.case("and a cursor below the first allocatable block is lifted to it")
+    test.assert(nvfswear.alloc_candidate(nvfswear.alloc(0 - 5), 256) == nvfswear.first_allocatable())

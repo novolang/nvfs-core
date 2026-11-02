@@ -1,9 +1,6 @@
 // nvfsop_tests.nv — the state machine, and what the action-as-a-value
 // shape buys.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: nvfs-core.nvfsop.<fn>`.
-//
 // THIS SUITE IS THE ARGUMENT FOR `NvfsAction`.  Every case below drives
 // a real filesystem operation to completion with no device, no trait
 // and no `[io]` — the "device" is `erased_block`, forty lines up, and a
@@ -82,7 +79,7 @@ fn test_every_action_is_one_of_littlefss_four_callbacks() [io]
     test.case("a read names a block, an offset and a length")
     test.assert(nvfsop.action_block(NvfsRead(3, 0, 16)) == 3)
     test.assert(nvfsop.action_length(NvfsRead(3, 0, 16)) == 16)
-    test.assert(nvfsop.action_is_write(NvfsRead(3, 0, 16)) == false)
+    test.assert(not nvfsop.action_is_write(NvfsRead(3, 0, 16)))
 
     test.case("a program names a block, an offset and the bytes")
     test.assert(nvfsop.action_block(NvfsProg(3, 0, bytes.zeros(16))) == 3)
@@ -96,7 +93,7 @@ fn test_every_action_is_one_of_littlefss_four_callbacks() [io]
 
     test.case("and a sync names nothing")
     test.assert(nvfsop.action_block(NvfsSync) == 0 - 1)
-    test.assert(nvfsop.action_is_write(NvfsSync) == false)
+    test.assert(not nvfsop.action_is_write(NvfsSync))
 
 @test
 fn test_every_action_a_machine_emits_respects_the_devices_alignment() [io]
@@ -108,13 +105,13 @@ fn test_every_action_a_machine_emits_respects_the_devices_alignment() [io]
     test.assert(nvfsop.action_is_valid(NvfsRead(0, 0, 16), g))
 
     test.case("a misaligned one is not")
-    test.assert(nvfsop.action_is_valid(NvfsRead(0, 1, 16), g) == false)
+    test.assert(not nvfsop.action_is_valid(NvfsRead(0, 1, 16), g))
 
     test.case("one past the end of the block is not")
-    test.assert(nvfsop.action_is_valid(NvfsRead(0, 512, 16), g) == false)
+    test.assert(not nvfsop.action_is_valid(NvfsRead(0, 512, 16), g))
 
     test.case("nor is one naming a block past the end of the device")
-    test.assert(nvfsop.action_is_valid(NvfsErase(32), g) == false)
+    test.assert(not nvfsop.action_is_valid(NvfsErase(32), g))
 
     test.case("and the mount's own first action is valid")
     let p = nvfsop.begin(g, nvfsvol.default_config(), NvfsMount)
@@ -141,7 +138,7 @@ fn test_an_erased_device_mounts_as_no_filesystem_rather_than_as_damage() [io]
     test.assert(nvfsop.actions_taken(p.machine) > 0)
 
     test.case("it read rather than wrote — a mount never changes the device")
-    test.assert(nvfsop.op_is_mutating(NvfsMount) == false)
+    test.assert(not nvfsop.op_is_mutating(NvfsMount))
 
 @test
 fn test_a_format_writes_and_then_a_mount_finds_what_it_wrote() [io]
@@ -163,10 +160,10 @@ fn test_which_operations_can_change_the_device_is_a_question_with_an_answer() [i
     // A read-only volume can refuse the writing operations before they
     // start rather than failing partway.
     test.case("the reading operations")
-    test.assert(nvfsop.op_is_mutating(NvfsStat("/a")) == false)
-    test.assert(nvfsop.op_is_mutating(NvfsReadDir("/")) == false)
-    test.assert(nvfsop.op_is_mutating(NvfsCheck) == false)
-    test.assert(nvfsop.op_is_mutating(NvfsSeek(1, 0, 0)) == false)
+    test.assert(not nvfsop.op_is_mutating(NvfsStat("/a")))
+    test.assert(not nvfsop.op_is_mutating(NvfsReadDir("/")))
+    test.assert(not nvfsop.op_is_mutating(NvfsCheck))
+    test.assert(not nvfsop.op_is_mutating(NvfsSeek(1, 0, 0)))
 
     test.case("the writing ones")
     test.assert(nvfsop.op_is_mutating(NvfsMkdir("/logs")))
@@ -186,14 +183,14 @@ fn test_a_handle_is_a_number_the_machine_remembers_and_nothing_on_disk() [io]
     // stateless, so an append reads the whole file and writes it back.
     test.case("a machine that has opened nothing has no handles")
     let p = nvfsop.begin(small_geometry(), nvfsvol.default_config(), NvfsMount)
-    test.assert(nvfsop.handle_is_open(p.machine, 1) == false)
+    test.assert(not nvfsop.handle_is_open(p.machine, 1))
 
     test.case("and a handle it does not have has no position")
     test.assert(nvfsop.handle_position(p.machine, 1) == 0 - 1)
 
     test.case("an open is a mutating operation only when it may create")
     test.assert(nvfsop.op_is_mutating(NvfsOpen("/a", true)))
-    test.assert(nvfsop.op_is_mutating(NvfsOpen("/a", false)) == false)
+    test.assert(not nvfsop.op_is_mutating(NvfsOpen("/a", false)))
 
 @test
 fn test_a_mismatched_answer_is_refused_rather_than_papered_over() [io]
