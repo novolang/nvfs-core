@@ -5,11 +5,13 @@ All notable changes to nvfs-core are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
 - Internal: ladders rewritten as match. The operation phases, the metadata-pair dispatch and the volume checks read as one match on the phase or the code. No signature, constant or behaviour changed.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-12
 
